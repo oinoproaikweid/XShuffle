@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Xshuffle",
+  "version": "1.1.2",
+  "description": "Shuffle to a random day from an X account's history.",
+  "permissions": ["storage", "activeTab", "scripting", "alarms"],
+  "action": {
+    "default_title": "Xshuffle",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
