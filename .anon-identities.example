@@ -1,0 +1,29 @@
+# Example identity terms for the release privacy gate.
+#
+# Copy this to .anon-identities (which is gitignored and never committed)
+# and fill it in with YOUR real identity:
+#
+#     cp .anon-identities.example .anon-identities
+#
+# One regex per line. Comments start with '#'. The gate fails closed: with no
+# terms file it refuses to pass, because "no terms" cannot prove anything is
+# clean. A malformed regex also blocks the release rather than silently
+# matching nothing.
+#
+# What to include, anything that could link a public artefact back to you:
+#   * your real name and spelling variants
+#   * your real email address and its domain
+#   * your other/personal account handles on any platform
+#   * local filesystem paths that contain your OS username
+#   * names of private or personal projects
+#   * any working notes or handoff documents that should not be public
+
+# --- examples (replace or delete) ---
+#\bYourRealName\b
+#\bAnotherSurname\b
+# you@yourdomain\.com
+#\byourdomain\.com
+# your-personal-handle
+# /home/yourusername
+# /Users/yourusername
+# your-private-project

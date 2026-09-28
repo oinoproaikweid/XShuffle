@@ -5,3 +5,9 @@
 node_modules/
 grasp-report.json
 dist/
+
+# Local-only privacy gate identity terms. This file must NEVER be committed:
+# it names the real identity that the public account is meant to hide.
+.anon-identities
+.anon-identities.local
+.anon-identities.*.local

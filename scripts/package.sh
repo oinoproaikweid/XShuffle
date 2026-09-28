@@ -76,3 +76,16 @@ echo "Built:"
 ls -lh "$OUT/xshuffle-$VERSION.zip" | awk '{print "  zip    ", $5, $9}'
 echo "  folder ", "$STAGE"
 du -sh "$STAGE" | awk '{print "  size   ", $1, "unpacked"}'
+
+# Privacy gate: every package is checked, not just releases. If the local
+# terms file is absent the gate fails closed, so a missing config blocks the
+# build rather than letting anything ship unchecked.
+echo
+echo "Privacy gate (package):"
+if [ -x scripts/privacy-gate.sh ]; then
+  ./scripts/privacy-gate.sh --files "$STAGE" --archive "$OUT/xshuffle-$VERSION.zip"
+else
+  echo "  scripts/privacy-gate.sh not found or not executable." >&2
+  echo "  cp .anon-identities.example .anon-identities and chmod +x the script." >&2
+  exit 1
+fi
