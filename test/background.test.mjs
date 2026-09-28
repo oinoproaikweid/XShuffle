@@ -27,7 +27,7 @@ function eq(name, actual, expected) {
 
 /** Build a fresh mock chrome API + sandbox, load background.js, return handles. */
 function makeWorker({ today = '2026-09-28' } = {}) {
-  const store = { session: {} };
+  const store = { session: {}, local: {} };
   const log = { created: [], updated: [], removed: [], messages: [], alarms: [], cleared: [] };
   let nextTabId = 500;
   let messageListener = null;
@@ -52,6 +52,18 @@ function makeWorker({ today = '2026-09-28' } = {}) {
         set(obj, cb) { Object.assign(store.session, obj); cb && cb(); },
         get(key, cb) { const r = {}; r[key] = store.session[key]; cb && cb(r); },
         remove(key) { delete store.session[key]; },
+      },
+      // local backs the rate-limit scan counter, which must survive a
+      // service-worker restart, so it is deliberately separate from session.
+      local: {
+        set(obj, cb) { Object.assign(store.local, obj); cb && cb(); },
+        get(key, cb) {
+          const r = {};
+          if (typeof key === 'string') r[key] = store.local[key];
+          else for (const k of Object.keys(key)) r[k] = key[k] === undefined ? store.local[k] : store.local[k] ?? key[k];
+          cb && cb(r);
+        },
+        remove(key) { delete store.local[key]; },
       },
     },
     alarms: {
@@ -103,6 +115,12 @@ const scanSender = (url, id) => ({ url, tab: { id, url } });
 const WIN = /since:(\d{4}-\d{2}-\d{2})\+until:(\d{4}-\d{2}-\d{2})/;
 function windowOf(url) { return decodeURIComponent(url).match(WIN); }
 const scanTabIdOf = w => w.log.created[0]?.id;
+/**
+ * Let queued callbacks and storage mocks run. A scan that starts cleanly does
+ * not reply until it finishes, so tests that only care that a tab opened must
+ * yield the event loop rather than await the response.
+ */
+const tick = () => new Promise(resolve => setImmediate(resolve));
 
 // ---------------------------------------------------------------- URL building
 
@@ -127,20 +145,44 @@ console.log('\n\x1b[1mURL construction\x1b[0m');
 
 // ---------------------------------------------------------- window selection
 
-console.log('\n\x1b[1mWindow selection (7-day, non-overlapping, older-weighted)\x1b[0m');
+const formatDay = d => d.toISOString().slice(0, 10);
+
+console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
 {
-  // Joined 2023-01-01, today 2026-09-28 => many windows available.
+  // The first tab opened is the probe: one search across the whole history.
   const w = makeWorker();
-  await w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1 }, profileSender('https://x.com/bob', 1));
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72 }, profileSender('https://x.com/bob', 1));
+  await tick();
   const url = decodeURIComponent(w.log.created[0].url);
   const m = windowOf(url);
-  check('window has since/until', !!m);
+  check('probe has since/until', !!m);
+  check('probe is flagged so the page returns every post', /xs_probe=1/.test(url), url.slice(0, 120));
   if (m) {
     const s = new Date(m[1] + 'T00:00:00Z'), e = new Date(m[2] + 'T00:00:00Z');
-    const days = Math.round((e - s) / 86400000);
-    check('window is <= 7 days wide', days <= 7, `got ${days}`);
-    check('window starts on/after join date', s >= new Date('2023-01-01T00:00:00Z'));
-    check('window ends in the future-ward direction', e > s);
+    check('probe starts at the join date', formatDay(s) === '2023-01-01', formatDay(s));
+    check('probe covers the whole account lifetime',
+      Math.round((e - s) / 86400000) > 1000, `${Math.round((e - s) / 86400000)} days`);
+  }
+  check('probe searches in the background', w.log.created[0].active === false);
+}
+{
+  // With an empty probe, the worker falls back to an adaptively sized window.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72 }, profileSender('https://x.com/bob', 1));
+  await tick();
+  const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
+  const scanId = scanTabIdOf(w);
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
+  await tick();
+  const fallback = decodeURIComponent(w.log.updated[w.log.updated.length - 1].url);
+  const fm = windowOf(fallback);
+  check('empty probe falls back to a windowed search', !!fm, fallback.slice(0, 120));
+  check('fallback window is not the probe', !/xs_probe=1/.test(fallback));
+  if (fm) {
+    const days = Math.round((new Date(fm[2] + 'T00:00:00Z') - new Date(fm[1] + 'T00:00:00Z')) / 86400000);
+    // 72 posts over ~44 months is a rare poster, so the solver widens past the
+    // old fixed 7 days - see test/adaptive.test.mjs.
+    check('fallback window is sized from the posting rate', days > 7 && days <= 90, `${days} days`);
   }
 }
 {
@@ -226,11 +268,20 @@ for (const [label, msg] of badCases) {
 // -------------------------------------------------------- post validation
 
 console.log('\n\x1b[1mScan result validation\x1b[0m');
-async function startScan(username = 'frank', joinDate = '2023-01-01') {
+/**
+ * Start a scan and drive it past the probe, exactly as the content script
+ * would: the first opened tab is the whole-history probe, and an empty probe
+ * is what pushes the worker into the windowed scan that sets currentWindow.
+ */
+async function startScan(username = 'frank', joinDate = '2023-01-01', { postCount = 72 } = {}) {
   const w = makeWorker();
-  await w.send({ type: 'xshuffle:discover', username, joinDate, requestId: 1 }, profileSender(`https://x.com/${username}`, 1));
-  const tok = Object.keys(w.store.session)[0].replace('xshuffle:', '');
+  w.send({ type: 'xshuffle:discover', username, joinDate, requestId: 1, postCount }, profileSender(`https://x.com/${username}`, 1));
+  await tick();
+  const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
   const scanId = scanTabIdOf(w);
+  // The probe returns nothing, so the worker falls back to a windowed scan.
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
+  await tick();
   w.tabUrls[scanId] = 'https://x.com/search?q=x';
   // The user's tab (id 1) still shows the profile the scan started from.
   w.tabUrls[1] = `https://x.com/${username}`;
@@ -286,7 +337,10 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '9', day } }, scanSender('https://x.com/search?q=x', scanId));
   const completion = w.log.messages.filter(m => m.msg.type === 'xshuffle:complete').pop();
   check('refuses to hijack a different profile', completion?.msg.response?.ok === false);
-  check('does not navigate the tab', w.log.updated.length === 0, `updated=${w.log.updated.length}`);
+  // The fallback window already updated the scan tab, so assert the user's own
+  // tab (id 1) was left alone rather than counting every tab update.
+  check('does not navigate the user\'s tab', !w.log.updated.some(u => u.id === 1),
+    JSON.stringify(w.log.updated.map(u => u.id)));
 }
 {
   const { w, tok, scanId } = await startScan('ivan');

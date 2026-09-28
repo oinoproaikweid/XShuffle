@@ -69,13 +69,45 @@ print(f"  manifest v{m['version']} verified, {len(refs)} manifest refs present")
 print(f"  popup assets followed, {len(expected)} files total, none extraneous")
 PY
 
-( cd "$OUT" && zip -qr "xshuffle-$VERSION.zip" "xshuffle-$VERSION" )
+# Two archives, because the two audiences want different shapes:
+#
+#   xshuffle-<v>.zip        flat, manifest.json at the root. This is what the
+#                           Chrome Web Store, Edge Add-ons and the other
+#                           stores require - an upload with a wrapping folder
+#                           is rejected outright.
+#   xshuffle-<v>-src.zip    same files under one top-level folder. This is
+#                           what someone unpacking a GitHub release expects,
+#                           and what Firefox's about:debugging accepts.
+#
+# The unpacked folder is also left on disk for "Load unpacked".
+rm -f "$OUT/xshuffle-$VERSION.zip" "$OUT/xshuffle-$VERSION-src.zip"
+# Resolve the archive paths before cd'ing, since the zip calls run inside the
+# directory being archived and a relative path would no longer resolve.
+STORE_ZIP="$(cd "$OUT" && pwd)/xshuffle-$VERSION.zip"
+SRC_ZIP="$(cd "$OUT" && pwd)/xshuffle-$VERSION-src.zip"
+( cd "$STAGE" && zip -qr "$STORE_ZIP" . -x '.*' )
+( cd "$OUT" && zip -qr "$SRC_ZIP" "xshuffle-$VERSION" )
+
+# Both archives must pass the privacy gate, and the flat one must really be
+# flat: a store silently ignoring a nested manifest is a bad way to find out.
+python3 - "$STORE_ZIP" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    names = [n for n in z.namelist() if not n.endswith('/')]
+if 'manifest.json' not in names:
+    sys.exit(f"store archive must have manifest.json at the root; got: {names}")
+depth = {n.count('/') for n in names}
+if len(depth) != 1:
+    sys.exit(f"store archive must be flat; got nesting: {sorted(names)}")
+print(f"  store archive is flat, manifest.json at root ({len(names)} files)")
+PY
 
 echo
 echo "Built:"
-ls -lh "$OUT/xshuffle-$VERSION.zip" | awk '{print "  zip    ", $5, $9}'
-echo "  folder ", "$STAGE"
-du -sh "$STAGE" | awk '{print "  size   ", $1, "unpacked"}'
+ls -lh "$STORE_ZIP" | awk '{print "  store zip  ", $5, $9}'
+ls -lh "$SRC_ZIP" | awk '{print "  source zip ", $5, $9}'
+echo "  folder     " "$STAGE"
+du -sh "$STAGE" | awk '{print "  size       ", $1, "unpacked"}'
 
 # Privacy gate: every package is checked, not just releases. If the local
 # terms file is absent the gate fails closed, so a missing config blocks the
@@ -83,7 +115,7 @@ du -sh "$STAGE" | awk '{print "  size   ", $1, "unpacked"}'
 echo
 echo "Privacy gate (package):"
 if [ -x scripts/privacy-gate.sh ]; then
-  ./scripts/privacy-gate.sh --files "$STAGE" --archive "$OUT/xshuffle-$VERSION.zip"
+  ./scripts/privacy-gate.sh --files "$STAGE" --archive "$STORE_ZIP" --archive "$SRC_ZIP"
 else
   echo "  scripts/privacy-gate.sh not found or not executable." >&2
   echo "  cp .anon-identities.example .anon-identities and chmod +x the script." >&2

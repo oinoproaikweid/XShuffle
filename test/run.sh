@@ -14,3 +14,12 @@ node test/background.test.mjs
 echo
 echo "== content (DOM parsing) =="
 node test/content.test.mjs
+echo
+echo "== adaptive window (posting-rate sizing) =="
+node test/adaptive.test.mjs
+echo
+echo "== search options (filters, range, cooldown) =="
+node test/options.test.mjs
+echo
+echo "== probe search (whole-history lookup) =="
+node test/probe.test.mjs

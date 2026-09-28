@@ -54,6 +54,35 @@
     return date.toISOString().slice(0, 10);
   }
 
+  /**
+   * The account's lifetime post count, as X renders it on the profile.
+   * Used to size the search window: a busy account can be scanned in short
+   * spans, a rare poster needs a wide one. Handles the compact forms X uses
+   * for large numbers - "72", "429.2K", "3M", "1,234,567".
+   */
+  function parsePostCount(text) {
+    // \s* rather than \s+ before the word: X renders a space, but tolerating
+    // its absence costs nothing and guards against a markup change.
+    const match = String(text || '').match(/([\d][\d,.]*)\s*([KMB]?)\s*[Pp]osts/);
+    if (!match) return null;
+    const value = Number(match[1].replace(/,/g, ''));
+    if (!Number.isFinite(value)) return null;
+    const multiplier = { '': 1, K: 1e3, M: 1e6, B: 1e9 }[match[2].toUpperCase()];
+    return value * multiplier;
+  }
+
+  function getPostCount() {
+    const header = document.querySelector(SELECTORS.header);
+    const primary = document.querySelector(SELECTORS.primary);
+    const candidates = [header?.innerText, header?.textContent, primary?.textContent?.slice(0, 3000)]
+      .filter(Boolean);
+    for (const text of candidates) {
+      const count = parsePostCount(text);
+      if (count !== null) return count;
+    }
+    return null;
+  }
+
   function getSearchContext() {
     if (location.pathname !== '/search') return null;
     const params = new URLSearchParams(location.search);
@@ -63,7 +92,10 @@
     const joinDate = new Date(`${join}T00:00:00Z`);
     if (!Number.isFinite(joinDate.getTime()) || formatDate(joinDate) !== join || joinDate > new Date()) return null;
     const postId = params.get('xs_post');
-    return { username, joinDate, postId: /^\d+$/.test(postId || '') ? postId : null };
+    // The probe is one wide search over the whole history, used to learn
+    // which days actually contain posts instead of guessing at a window.
+    const probe = params.get('xs_probe') === '1';
+    return { username, joinDate, postId: /^\d+$/.test(postId || '') ? postId : null, probe };
   }
 
   function removeShuffleUI() {
@@ -84,6 +116,35 @@
     let sibling = menu;
     while (sibling.parentElement && !sibling.parentElement.contains(form)) sibling = sibling.parentElement;
     return sibling.parentElement?.contains(form) ? sibling : null;
+  }
+
+  const DEFAULT_OPTIONS = {
+    excludeReplies: false,
+    mediaOnly: false,
+    openSinglePost: false,
+    rangeStart: '',
+    rangeEnd: ''
+  };
+
+  /**
+   * Search options chosen in the popup. Read straight from storage on each
+   * click so a change takes effect without reloading the page.
+   */
+  function loadOptions() {
+    const options = { ...DEFAULT_OPTIONS };
+    try {
+      const raw = localStorage.getItem('xshuffle:options');
+      if (raw) Object.assign(options, JSON.parse(raw));
+    } catch {
+      // malformed or unavailable storage keeps the defaults
+    }
+    return {
+      excludeReplies: options.excludeReplies === true,
+      mediaOnly: options.mediaOnly === true,
+      openSinglePost: options.openSinglePost === true,
+      rangeStart: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeStart || '') ? options.rangeStart : '',
+      rangeEnd: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '') ? options.rangeEnd : ''
+    };
   }
 
   function injectShuffleUI(username, joinDate, host, search = false, before = null) {
@@ -121,7 +182,9 @@
         type: 'xshuffle:discover',
         requestId,
         username,
-        joinDate: formatDate(date)
+        joinDate: formatDate(date),
+        postCount: getPostCount(),
+        options: loadOptions()
       }, response => {
         if (button.dataset.requestId !== requestId) return;
         clearTimeout(recoveryTimer);
@@ -138,9 +201,20 @@
     else host.append(panel);
   }
 
+  /**
+   * A single-post page (/user/status/123) still shows that author's header, so
+   * Shuffle can be offered there too - otherwise choosing "open one post" would
+   * strand the user on a page with no way to shuffle again.
+   */
+  function getPostPageUsername() {
+    const match = location.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/status\/\d+/);
+    if (!match) return null;
+    return RESERVED.has(match[1].toLowerCase()) ? null : match[1];
+  }
+
   function refresh() {
     if (!enabled) { removeShuffleUI(); return; }
-    const username = getCurrentProfileUsername();
+    const username = getCurrentProfileUsername() || getPostPageUsername();
     const header = document.querySelector(SELECTORS.header);
     const primary = document.querySelector(SELECTORS.primary);
     const search = getSearchContext();
@@ -246,6 +320,23 @@
       if (date < context.joinDate || date > todayUtc) continue;
       posts.set(status[2], { id: status[2], day: formatDate(date) });
     }
+
+    // The probe search spans the account's whole history, so whatever it
+    // returns is a complete picture of what X will serve. Report every post
+    // back rather than one, and let the worker choose - the worker may want to
+    // retry a day that has already been tried, which a single random pick here
+    // cannot express.
+    if (context.probe) {
+      if (posts.size) {
+        reportDiscovery({ id: null, day: null, probe: [...posts.values()] });
+        return;
+      }
+      if (/\bNo results for\b/i.test(primary.innerText || '')) {
+        reportDiscovery(null);
+      }
+      return;
+    }
+
     if (posts.size) {
       const matches = [...posts.values()];
       reportDiscovery(matches[Math.floor(Math.random() * matches.length)]);
@@ -290,8 +381,10 @@
     if (message?.type !== 'xshuffle:progress') return;
     const labels = {
       picking: 'Picking a date…',
+      probing: 'Reading their post history…',
       looking: 'Looking for posts…',
-      retrying: 'Retrying…'
+      retrying: 'Retrying…',
+      widening: 'Widening the date range…'
     };
     if (labels[message.stage]) button.textContent = labels[message.stage];
     if (message.stage === 'looking' && message.window?.start && message.window?.end) {

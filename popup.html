@@ -15,6 +15,39 @@
           <input id="show-shuffle-ui" type="checkbox" checked>
           <span id="toggle-status">Enabled</span>
         </label>
+
+        <div class="xshuffle-popup-label">Search options</div>
+
+        <label class="xshuffle-check">
+          <input id="opt-exclude-replies" type="checkbox">
+          <span>Hide replies</span>
+        </label>
+
+        <label class="xshuffle-check">
+          <input id="opt-media-only" type="checkbox">
+          <span>Photos and video only</span>
+        </label>
+
+        <label class="xshuffle-check">
+          <input id="opt-single-post" type="checkbox">
+          <span>Open one post instead of a result list</span>
+        </label>
+
+        <div class="xshuffle-popup-label">Date range</div>
+        <div class="xshuffle-range">
+          <label class="xshuffle-range-field">
+            <span>From</span>
+            <input id="opt-range-start" type="date">
+          </label>
+          <label class="xshuffle-range-field">
+            <span>To</span>
+            <input id="opt-range-end" type="date">
+          </label>
+        </div>
+        <div class="xshuffle-hint">Leave blank to size the range from how often the account posts.</div>
+
+        <div id="rate-limit-notice" class="xshuffle-notice" hidden></div>
+
         <div class="xshuffle-footer">
           <button id="close-popup" class="xshuffle-button" type="button">Close</button>
         </div>
