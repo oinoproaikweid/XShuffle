@@ -106,6 +106,20 @@ const REAL_POSTS = [
   { id: '111', day: '2023-02-20' }
 ];
 
+const YOUNG_POSTS = [
+  { id: '111', day: '2026-06-15' },
+  { id: '222', day: '2026-07-04' },
+  { id: '333', day: '2026-07-04' },
+  { id: '444', day: '2026-09-01' }
+];
+
+// A probe is only trusted when one page could plausibly span the account, so
+// the tests that exercise the probe path need a young account. This one joined
+// in 2026, short enough that a single page of results could cover it.
+async function startYoungProbe(options = {}) {
+  return startProbe(options, '2026-06-01');
+}
+
 console.log('\nProbe search URL');
 
 {
@@ -134,19 +148,19 @@ console.log('\nProbe search URL');
 console.log('\nProbe result handling');
 
 {
-  const { w, tok, probeUrl, scanId } = await startProbe();
+  const { w, tok, probeUrl, scanId } = await startYoungProbe();
   w.setTabUrl(1, 'https://x.com/liljayxxo');
   const r = await w.send(
-    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
   eq('a probe with posts succeeds immediately', r?.ok, true);
   const dest = w.log.updated.filter(u => u.id === 1).map(u => u.url);
   eq('the user tab is navigated once', dest.length, 1);
   const q = dest.length ? new URL(dest[0]).searchParams.get('q') : '';
   check('it navigates to a day that really has a post',
-    REAL_POSTS.some(p => `since:${p.day}` === /since:\S+/.exec(q)?.[0]), q);
+    YOUNG_POSTS.some(p => `since:${p.day}` === /since:\S+/.exec(q)?.[0]), q);
   check('the chosen day comes from the probe, not a guess',
-    ['2023-02-20', '2024-02-29', '2025-04-23'].some(d => q.includes(`since:${d}`)), q);
+    YOUNG_POSTS.some(p => q.includes(`since:${p.day}`)), q);
   check('the scan tab is closed', w.log.removed.includes(scanId));
 }
 
@@ -164,25 +178,25 @@ console.log('\nProbe result handling');
 console.log('\nProbe result validation');
 
 {
-  const { w, tok, probeUrl, scanId } = await startProbe();
+  const { w, tok, probeUrl, scanId } = await startYoungProbe();
   w.setTabUrl(1, 'https://x.com/liljayxxo');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [
-      { id: 'not-numeric', day: '2024-01-01' },
+      { id: 'not-numeric', day: '2026-07-01' },
       { id: '555', day: 'not-a-date' },
       { id: '666', day: '2019-01-01' },          // before join
       { id: '777', day: '2027-01-01' },          // future
-      { id: '888', day: '2024-05-05' }           // the only valid one
+      { id: '888', day: '2026-08-05' }           // the only valid one
     ] } },
     scanSender(probeUrl, scanId));
   eq('a probe with one valid post still succeeds', r?.ok, true);
   const dest = w.log.updated.filter(u => u.id === 1).map(u => new URL(u.url).searchParams.get('q'));
-  check('invalid probe entries are discarded', dest.length === 1 && /since:2024-05-05/.test(dest[0]),
+  check('invalid probe entries are discarded', dest.length === 1 && /since:2026-08-05/.test(dest[0]),
     JSON.stringify(dest));
 }
 
 {
-  const { w, tok, probeUrl, scanId } = await startProbe();
+  const { w, tok, probeUrl, scanId } = await startYoungProbe();
   w.setTabUrl(1, 'https://x.com/liljayxxo');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [] } },
@@ -197,66 +211,27 @@ console.log('\nProbe result validation');
 
 {
   // A manual range must also bound which probe results are acceptable.
-  const { w, tok, probeUrl, scanId } = await startProbe({ rangeStart: '2025-01-01', rangeEnd: '2025-12-31' });
+  const { w, tok, probeUrl, scanId } = await startYoungProbe({ rangeStart: '2026-07-01', rangeEnd: '2026-08-01' });
   w.setTabUrl(1, 'https://x.com/liljayxxo');
   await w.send(
-    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
   const dest = w.log.updated.filter(u => u.id === 1).map(u => new URL(u.url).searchParams.get('q'));
   check('posts outside the manual range are discarded',
-    dest.every(q => /since:2025-04-23/.test(q)), JSON.stringify(dest));
+    dest.every(q => /since:2026-07-04/.test(q)), JSON.stringify(dest));
 }
 
 console.log('\nProbe distribution');
 
 {
-  // Older posts should be favoured, matching the windowed scan's bias.
+  // The probe is only trusted for a short-lived account, so the spread between
+  // its posts is small. Check the ordering holds and that no day is unreachable.
   const counts = {};
   for (let i = 0; i < 300; i++) {
-    const { w, tok, probeUrl, scanId } = await startProbe();
+    const { w, tok, probeUrl, scanId } = await startYoungProbe();
     w.setTabUrl(1, 'https://x.com/liljayxxo');
     await w.send(
-      { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
-      scanSender(probeUrl, scanId));
-    const dest = w.log.updated.filter(u => u.id === 1);
-    if (dest.length) {
-      const q = new URL(dest[0].url).searchParams.get('q');
-      const day = (/since:(\S+)/.exec(q) || [])[1];
-      if (day) counts[day] = (counts[day] || 0) + 1;
-    }
-  }
-  const oldest = counts['2023-02-20'] || 0;
-  const newest = counts['2025-04-23'] || 0;
-  check('the oldest post is drawn more often than the newest',
-    oldest > newest, `oldest=${oldest} newest=${newest}`);
-  // Weighting is by age, not by rank in the result list, so a much older post
-  // should lead clearly rather than by a hair. Guard the spread so the bias
-  // cannot silently flatten out or invert.
-  check('age weighting favours the back catalogue',
-    oldest > newest * 1.5, `oldest=${oldest} newest=${newest}`);
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  check('every draw lands on a real post day', total === 300, `${total}/300`);
-}
-
-{
-  // Weighting must be by age, not by rank in the sorted list. On an evenly
-  // spread history the two agree, so this case is deliberately lopsided: one
-  // ancient post against a cluster of last-week posts. Age weighting should
-  // treat that lone 2009 post as the pick worth making, which rank weighting
-  // cannot do - it would only give it a one-position advantage.
-  const span = [
-    { id: '901', day: '2009-03-01' },
-    { id: '902', day: '2026-09-21' }, { id: '903', day: '2026-09-22' },
-    { id: '904', day: '2026-09-23' }, { id: '905', day: '2026-09-24' },
-    { id: '906', day: '2026-09-25' }
-  ];
-  const counts = {};
-  const runs = 300;
-  for (let i = 0; i < runs; i++) {
-    const { w, tok, probeUrl, scanId } = await startProbe({}, '2009-01-01');
-    w.setTabUrl(1, 'https://x.com/liljayxxo');
-    await w.send(
-      { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: span } },
+      { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
       scanSender(probeUrl, scanId));
     const dest = w.log.updated.filter(u => u.id === 1);
     if (dest.length) {
@@ -264,11 +239,57 @@ console.log('\nProbe distribution');
       if (day) counts[day] = (counts[day] || 0) + 1;
     }
   }
-  const ancient = counts['2009-03-01'] || 0;
-  check('weighting is by age: a lone old post dominates a recent cluster',
-    ancient > runs * 0.5, `2009 drawn ${ancient}/${runs}`);
-  check('recent posts stay reachable',
-    Object.keys(counts).length === 6, `landed on ${Object.keys(counts).length} distinct days`);
+  // This account's posts are all within months of each other, so the age
+  // weights are nearly equal and the order is not a meaningful signal. What
+  // must hold is that every draw lands on a day the probe actually reported.
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  check('every draw lands on a real post day', total === 300, `${total}/300`);
+  check('no day outside the probe results is ever chosen',
+    Object.keys(counts).every(day => YOUNG_POSTS.some(p => p.day === day)),
+    JSON.stringify(Object.keys(counts)));
+}
+
+console.log('\nProbe trust');
+
+{
+  // The bug this guards: a probe is one page of X results, served newest
+  // first. Age-weighting that page still lands near today when the back
+  // catalogue was never on it, so a long-lived account must skip the probe and
+  // use the windowed scan instead.
+  const { w, tok, probeUrl, scanId } = await startProbe();
+  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  await w.send(
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
+    scanSender(probeUrl, scanId));
+  const dest = w.log.updated.filter(u => u.id === 1);
+  eq('a long-lived account does not navigate straight from the probe', dest.length, 0);
+  // The windowed scan reuses the scan tab rather than opening a new one, and
+  // the user tab must be left alone until a post is actually found.
+  const wq = queryOf(w.log.created[1]?.url || w.log.updated.find(u => u.id === scanId)?.url || '');
+  const since = (/since:(\d{4}-\d{2}-\d{2})/.exec(wq) || [])[1];
+  const until = (/until:(\d{4}-\d{2}-\d{2})/.exec(wq) || [])[1];
+  // The window may legitimately start on the join date, so compare widths:
+  // the whole-history probe runs to tomorrow, a window is much shorter.
+  const width = since && until
+    ? Math.round((new Date(`${until}T00:00:00Z`) - new Date(`${since}T00:00:00Z`)) / 86400000)
+    : null;
+  check('it falls through to a bounded window search',
+    width !== null && width > 0 && width <= 90, `${width} days, q=${wq}`);
+}
+
+{
+  // A page of results is a sample, not the history. Even a young account with
+  // more posts than fit on one page must not trust it.
+  const many = Array.from({ length: 15 }, (_, i) => ({
+    id: String(700 + i), day: `2026-07-${String(i + 1).padStart(2, '0')}`
+  }));
+  const { w, tok, probeUrl, scanId } = await startYoungProbe();
+  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  await w.send(
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: many } },
+    scanSender(probeUrl, scanId));
+  const dest = w.log.updated.filter(u => u.id === 1);
+  eq('a full page of results is not trusted as the whole history', dest.length, 0);
 }
 
 console.log(`\nprobe search: ${pass} passed, ${failures.length} failed`);

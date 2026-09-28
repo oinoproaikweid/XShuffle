@@ -324,11 +324,10 @@
       posts.set(status[2], { id: status[2], day: formatDate(date) });
     }
 
-    // The probe search spans the account's whole history, so whatever it
-    // returns is a complete picture of what X will serve. Report every post
-    // back rather than one, and let the worker choose - the worker may want to
-    // retry a day that has already been tried, which a single random pick here
-    // cannot express.
+    // A probe search is one page of results, so it may only sample the
+    // account's history. Report every post it did see and let the worker
+    // decide whether that page is representative; it may also want to retry a
+    // day already tried, which a single random pick here cannot express.
     if (context.probe) {
       if (posts.size) {
         reportDiscovery({ id: null, day: null, probe: [...posts.values()] });

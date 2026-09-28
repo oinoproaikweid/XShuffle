@@ -26,6 +26,12 @@
   const TARGET_HIT = 0.9;
   const EMPTY_WINDOWS_BEFORE_WIDENING = 3;
   const MAX_WIDENING_STEPS = 2;
+  // A probe search returns one page of results, measured at about 15 posts.
+  // Past that count the page is a sample, not the account's history, so the
+  // windowed scan is the honest source of a date. The span guard covers the
+  // other case: a young account whose whole life is shorter than a few pages.
+  const PROBE_PAGE_LIMIT = 15;
+  const PROBE_TRUST_DAYS = 120;
 
   // Stop hammering X. Every scan opens real search requests, and X throttles
   // logged-in accounts that issue them quickly. Once this many scans run
@@ -529,6 +535,21 @@
           state.probing = false;
           finish(message.token, null, 'X returned no searchable posts for this account.');
           sendResponse({ ok: false });
+          return;
+        }
+        // A probe is one page of results, and X serves them newest first, so
+        // for an account with a long history it only ever reveals recent posts.
+        // Age-weighting that page would still land near today, because the
+        // back catalogue was never on the page to weigh. Only trust the probe
+        // when it plausibly saw the whole span: either few enough posts to fit
+        // on one page, or the account's own age is short enough that a page
+        // plausibly spans it. Otherwise fall through to the windowed scan,
+        // which searches a random older window directly.
+        const spanDays = Math.max(1, Math.ceil((todayUtc - parsedJoin) / 86400000));
+        if (valid.length >= PROBE_PAGE_LIMIT || spanDays > PROBE_TRUST_DAYS) {
+          state.probing = false;
+          scanNextWindow(message.token);
+          sendResponse({ ok: true });
           return;
         }
         // Prefer the back catalogue by age, not by position: the probe search
