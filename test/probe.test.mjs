@@ -96,12 +96,14 @@ async function startProbe(options = {}, joinDate = '2023-01-01') {
   return { w, tok, probeUrl, scanId: w.log.created[0].id };
 }
 
-// The four posts a real whole-history search returned for this account.
+// The four posts a real whole-history search returned for this account, in the
+// order X serves them. The probe search runs f=live, so the newest post comes
+// first - the worker must not assume oldest-first.
 const REAL_POSTS = [
-  { id: '111', day: '2023-02-20' },
-  { id: '222', day: '2024-02-29' },
+  { id: '444', day: '2025-04-23' },
   { id: '333', day: '2024-02-29' },
-  { id: '444', day: '2025-04-23' }
+  { id: '222', day: '2024-02-29' },
+  { id: '111', day: '2023-02-20' }
 ];
 
 console.log('\nProbe search URL');
@@ -227,6 +229,11 @@ console.log('\nProbe distribution');
   const newest = counts['2025-04-23'] || 0;
   check('the oldest post is drawn more often than the newest',
     oldest > newest, `oldest=${oldest} newest=${newest}`);
+  // The probe search returns newest first, so a weighting that assumed
+  // oldest-first would favour the recent post. Guard the spread, not just the
+  // ordering, so a future change cannot quietly re-invert the bias.
+  check('the newest post is not favoured over the oldest',
+    newest * 2 < oldest, `oldest=${oldest} newest=${newest}`);
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   check('every draw lands on a real post day', total === 300, `${total}/300`);
 }

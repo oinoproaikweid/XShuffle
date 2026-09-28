@@ -520,13 +520,17 @@
           return;
         }
         // Weight older posts up so a shuffle still favours the back catalogue.
-        const weights = valid.map((_, index) => valid.length - index);
+        // The probe search runs newest first, so sort oldest-first first -
+        // otherwise the weighting below would favour the most recent post,
+        // which is the opposite of what a shuffle is for.
+        const ordered = [...valid].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+        const weights = ordered.map((_, index) => ordered.length - index);
         const totalWeight = weights.reduce((sum, value) => sum + value, 0);
         let draw = Math.random() * totalWeight;
-        let chosen = valid[valid.length - 1];
-        for (let i = 0; i < valid.length; i++) {
+        let chosen = ordered[ordered.length - 1];
+        for (let i = 0; i < ordered.length; i++) {
           draw -= weights[i];
-          if (draw < 0) { chosen = valid[i]; break; }
+          if (draw < 0) { chosen = ordered[i]; break; }
         }
         finish(message.token, { id: chosen.id, day: chosen.day, found: valid.length });
         sendResponse({ ok: true });
