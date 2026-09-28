@@ -88,8 +88,8 @@ const queryOf = url => new URL(url).searchParams.get('q');
 
 async function startProbe(options = {}, joinDate = '2023-01-01') {
   const w = makeWorker();
-  w.send({ type: 'xshuffle:discover', username: 'liljayxxo', joinDate, requestId: 1, postCount: 72, options },
-    profileSender('https://x.com/liljayxxo'));
+  w.send({ type: 'xshuffle:discover', username: 'xtestuser', joinDate, requestId: 1, postCount: 72, options },
+    profileSender('https://x.com/xtestuser'));
   await tick();
   const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
   const probeUrl = w.log.created[0].url;
@@ -128,7 +128,7 @@ console.log('\nProbe search URL');
   // URLSearchParams encodes spaces in q= as '+', not %20.
   const q = new URL(probeUrl).searchParams.get('q');
   check('probe spans join date to tomorrow', /since:2023-01-01/.test(q) && /until:2026-09-29/.test(q), q);
-  check('probe is a single search over the whole history', /from:liljayxxo since:2023-01-01/.test(q), q);
+  check('probe is a single search over the whole history', /from:xtestuser since:2023-01-01/.test(q), q);
 }
 
 {
@@ -149,7 +149,7 @@ console.log('\nProbe result handling');
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
@@ -167,7 +167,7 @@ console.log('\nProbe result handling');
 {
   // The whole point: a rare poster with years between posts still succeeds.
   const { w, tok, probeUrl, scanId } = await startProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
     scanSender(probeUrl, scanId));
@@ -179,7 +179,7 @@ console.log('\nProbe result validation');
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [
       { id: 'not-numeric', day: '2026-07-01' },
@@ -197,7 +197,7 @@ console.log('\nProbe result validation');
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [] } },
     scanSender(probeUrl, scanId));
@@ -212,7 +212,7 @@ console.log('\nProbe result validation');
 {
   // A manual range must also bound which probe results are acceptable.
   const { w, tok, probeUrl, scanId } = await startYoungProbe({ rangeStart: '2026-07-01', rangeEnd: '2026-08-01' });
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
@@ -229,7 +229,7 @@ console.log('\nProbe distribution');
   const counts = {};
   for (let i = 0; i < 300; i++) {
     const { w, tok, probeUrl, scanId } = await startYoungProbe();
-    w.setTabUrl(1, 'https://x.com/liljayxxo');
+    w.setTabUrl(1, 'https://x.com/xtestuser');
     await w.send(
       { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
       scanSender(probeUrl, scanId));
@@ -257,7 +257,7 @@ console.log('\nProbe trust');
   // catalogue was never on it, so a long-lived account must skip the probe and
   // use the windowed scan instead.
   const { w, tok, probeUrl, scanId } = await startProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
     scanSender(probeUrl, scanId));
@@ -284,7 +284,7 @@ console.log('\nProbe trust');
     id: String(700 + i), day: `2026-07-${String(i + 1).padStart(2, '0')}`
   }));
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/liljayxxo');
+  w.setTabUrl(1, 'https://x.com/xtestuser');
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: many } },
     scanSender(probeUrl, scanId));

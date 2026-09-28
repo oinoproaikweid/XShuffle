@@ -4,7 +4,7 @@ import { solveWindowDays, monthsBetween } from './harness.mjs';
 
 const TODAY = '2026-09-28';
 const accounts = [
-  ['liljayxxo', '2023-01-01', 72],
+  ['xtestuser', '2023-01-01', 72],
   ['cnn', '2007-02-01', 429200],
   ['elonmusk', '2009-06-01', 109100],
   ['natgeo', '2008-11-01', 73600],
