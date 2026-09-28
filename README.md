@@ -9,6 +9,6 @@ Xshuffle adds a small Shuffle button to X profiles. **🎲 Shuffle** searches ra
 3. Enable **Developer mode**, choose **Load unpacked**, and select the extracted folder.
 4. Visit an `x.com/username` profile. Use the popup's **Show Shuffle UI** checkbox to hide or show both controls.
 
-To set your payment page, edit `const TIP_URL = "https://example.com";` near the top of `popup.js`, then reload the extension. The example URL is a placeholder until replaced.
+To enable a tip link, set `const TIP_URL = "https://your-page.example";` near the top of `popup.js`, then reload the extension. Leaving it empty removes the control from the popup.
 
 Xshuffle uses no X API, backend, analytics, telemetry, or post collection. It stores the show/hide preference locally and temporary search state in browser-session storage so searches can finish if the background service worker restarts. The tip link is the sole additional external destination. Random windows sample account history without requesting the full history in one search; X may limit visible results, so this is not a uniform sample of every post. It tries up to 30 windows before reporting no result. X may change its profile markup, in which case the centralized selectors in `content.js` may need updating. The popup follows the active X page's light, dim, or dark theme and falls back to the system theme on other pages.

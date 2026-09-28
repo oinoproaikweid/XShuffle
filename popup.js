@@ -1,7 +1,15 @@
 const toggle = document.getElementById("show-shuffle-ui");
 const status = document.getElementById("toggle-status");
-const TIP_URL = "https://example.com";
-document.getElementById("tip-link").href = TIP_URL;
+// Optional tip link. Set to a URL to enable it, or leave empty to hide the
+// control entirely. An empty string removes the button from the popup.
+const TIP_URL = "";
+
+const tipLink = document.getElementById("tip-link");
+if (TIP_URL) {
+  tipLink.href = TIP_URL;
+} else {
+  tipLink.remove();
+}
 
 function setTheme(theme) {
   document.body.dataset.theme = theme;
