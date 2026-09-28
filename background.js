@@ -519,12 +519,16 @@
           sendResponse({ ok: false });
           return;
         }
-        // Weight older posts up so a shuffle still favours the back catalogue.
-        // The probe search runs newest first, so sort oldest-first first -
-        // otherwise the weighting below would favour the most recent post,
-        // which is the opposite of what a shuffle is for.
+        // Prefer the back catalogue by age, not by position: the probe search
+        // returns newest first and caps out after a page of results, so rank
+        // says nothing about how far back a post sits. Weighting on the post's
+        // age means a 2009 post really is favoured over a 2026 one, and an
+        // account whose posts are all recent is left close to uniform.
         const ordered = [...valid].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
-        const weights = ordered.map((_, index) => ordered.length - index);
+        const weights = ordered.map(post => {
+          const ageDays = (todayUtc.getTime() - new Date(`${post.day}T00:00:00Z`).getTime()) / 86400000;
+          return 1 + Math.max(0, ageDays) / 365.25;
+        });
         const totalWeight = weights.reduce((sum, value) => sum + value, 0);
         let draw = Math.random() * totalWeight;
         let chosen = ordered[ordered.length - 1];

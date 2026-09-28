@@ -229,13 +229,46 @@ console.log('\nProbe distribution');
   const newest = counts['2025-04-23'] || 0;
   check('the oldest post is drawn more often than the newest',
     oldest > newest, `oldest=${oldest} newest=${newest}`);
-  // The probe search returns newest first, so a weighting that assumed
-  // oldest-first would favour the recent post. Guard the spread, not just the
-  // ordering, so a future change cannot quietly re-invert the bias.
-  check('the newest post is not favoured over the oldest',
-    newest * 2 < oldest, `oldest=${oldest} newest=${newest}`);
+  // Weighting is by age, not by rank in the result list, so a much older post
+  // should lead clearly rather than by a hair. Guard the spread so the bias
+  // cannot silently flatten out or invert.
+  check('age weighting favours the back catalogue',
+    oldest > newest * 1.5, `oldest=${oldest} newest=${newest}`);
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   check('every draw lands on a real post day', total === 300, `${total}/300`);
+}
+
+{
+  // Weighting must be by age, not by rank in the sorted list. On an evenly
+  // spread history the two agree, so this case is deliberately lopsided: one
+  // ancient post against a cluster of last-week posts. Age weighting should
+  // treat that lone 2009 post as the pick worth making, which rank weighting
+  // cannot do - it would only give it a one-position advantage.
+  const span = [
+    { id: '901', day: '2009-03-01' },
+    { id: '902', day: '2026-09-21' }, { id: '903', day: '2026-09-22' },
+    { id: '904', day: '2026-09-23' }, { id: '905', day: '2026-09-24' },
+    { id: '906', day: '2026-09-25' }
+  ];
+  const counts = {};
+  const runs = 300;
+  for (let i = 0; i < runs; i++) {
+    const { w, tok, probeUrl, scanId } = await startProbe({}, '2009-01-01');
+    w.setTabUrl(1, 'https://x.com/liljayxxo');
+    await w.send(
+      { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: span } },
+      scanSender(probeUrl, scanId));
+    const dest = w.log.updated.filter(u => u.id === 1);
+    if (dest.length) {
+      const day = (/since:(\S+)/.exec(new URL(dest[0].url).searchParams.get('q')) || [])[1];
+      if (day) counts[day] = (counts[day] || 0) + 1;
+    }
+  }
+  const ancient = counts['2009-03-01'] || 0;
+  check('weighting is by age: a lone old post dominates a recent cluster',
+    ancient > runs * 0.5, `2009 drawn ${ancient}/${runs}`);
+  check('recent posts stay reachable',
+    Object.keys(counts).length === 6, `landed on ${Object.keys(counts).length} distinct days`);
 }
 
 console.log(`\nprobe search: ${pass} passed, ${failures.length} failed`);
