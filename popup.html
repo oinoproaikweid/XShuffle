@@ -33,18 +33,15 @@
           <span>Open one post instead of a result list</span>
         </label>
 
-        <div class="xshuffle-popup-label">Date range</div>
+        <div class="xshuffle-popup-label">Search window</div>
         <div class="xshuffle-range">
           <label class="xshuffle-range-field">
-            <span>From</span>
-            <input id="opt-range-start" type="date">
+            <span>Days per search</span>
+            <input id="opt-window-days" type="range" min="0" max="90" step="1" value="0">
           </label>
-          <label class="xshuffle-range-field">
-            <span>To</span>
-            <input id="opt-range-end" type="date">
-          </label>
+          <output id="opt-window-days-value" class="xshuffle-range-value">Auto</output>
         </div>
-        <div class="xshuffle-hint">Leave blank to size the range from how often the account posts.</div>
+        <div class="xshuffle-hint" id="window-hint">X returns about 15 posts per search, so a wider window finds older posts but searches more. Auto sizes the window from how often the account posts.</div>
 
         <div id="rate-limit-notice" class="xshuffle-notice" hidden></div>
 

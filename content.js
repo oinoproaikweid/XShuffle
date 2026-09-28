@@ -122,6 +122,9 @@
     excludeReplies: false,
     mediaOnly: false,
     openSinglePost: false,
+    // null means Auto: let the worker size the window from the account's
+    // posting rate rather than a fixed number of days.
+    windowDays: null,
     rangeStart: '',
     rangeEnd: ''
   };

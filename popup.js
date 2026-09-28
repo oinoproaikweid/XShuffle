@@ -68,21 +68,41 @@ document.getElementById("close-popup").addEventListener("click", () => window.cl
 // cannot write page storage directly, so it stores them in extension storage and
 // the content script mirrors them across on load.
 
+const windowDaysInput = document.getElementById("opt-window-days");
+const windowDaysValue = document.getElementById("opt-window-days-value");
+const windowHint = document.getElementById("window-hint");
+
 const optionFields = {
   excludeReplies: document.getElementById("opt-exclude-replies"),
   mediaOnly: document.getElementById("opt-media-only"),
-  openSinglePost: document.getElementById("opt-single-post"),
-  rangeStart: document.getElementById("opt-range-start"),
-  rangeEnd: document.getElementById("opt-range-end")
+  openSinglePost: document.getElementById("opt-single-post")
 };
+
+// A slider needs an "off" position, and range inputs have no natural one, so
+// Auto sits at the far left as its own step before the day counts begin.
+const AUTO_WINDOW_DAYS = 0;
+const windowDaysToDays = value => (value === AUTO_WINDOW_DAYS ? null : value);
+
+function describeWindow(days) {
+  if (days === null) return "Auto";
+  return days === 1 ? "1 day" : `${days} days`;
+}
+
+function renderWindow() {
+  const days = windowDaysToDays(Number(windowDaysInput.value));
+  windowDaysValue.textContent = describeWindow(days);
+  windowDaysInput.setAttribute("aria-valuetext", describeWindow(days));
+  windowHint.textContent = days === null
+    ? "Auto sizes the window from how often the account posts. X returns about 15 posts per search, so a wider window finds older posts but searches more."
+    : `Each search covers ${describeWindow(days)}. X returns about 15 posts per search, so a wider window finds older posts but searches more.`;
+}
 
 function currentOptions() {
   return {
     excludeReplies: optionFields.excludeReplies.checked,
     mediaOnly: optionFields.mediaOnly.checked,
     openSinglePost: optionFields.openSinglePost.checked,
-    rangeStart: optionFields.rangeStart.value,
-    rangeEnd: optionFields.rangeEnd.value
+    windowDays: windowDaysToDays(Number(windowDaysInput.value))
   };
 }
 
@@ -90,8 +110,19 @@ function applyOptions(options) {
   for (const [key, field] of Object.entries(optionFields)) {
     if (!field) continue;
     if (typeof options[key] === "boolean") field.checked = options[key];
-    else if (typeof options[key] === "string") field.value = options[key];
   }
+  // Accept the old stored shape so an existing profile keeps working, then
+  // move it onto the slider.
+  if (typeof options.windowDays === "number" && options.windowDays > 0) {
+    windowDaysInput.value = String(Math.min(90, Math.max(1, Math.round(options.windowDays))));
+  } else if (options.rangeStart && options.rangeEnd) {
+    const span = Math.round(
+      (new Date(`${options.rangeEnd}T00:00:00Z`) - new Date(`${options.rangeStart}T00:00:00Z`)) / 86400000);
+    if (Number.isFinite(span) && span > 0) {
+      windowDaysInput.value = String(Math.min(90, Math.max(1, span)));
+    }
+  }
+  renderWindow();
 }
 
 function saveOptions() {
@@ -118,6 +149,12 @@ chrome.storage.local.get({ searchOptions: null }, ({ searchOptions }) => {
 for (const field of Object.values(optionFields)) {
   if (field) field.addEventListener("change", saveOptions);
 }
+
+// A range input fires "input" while dragging, so save on release but keep the
+// readout live.
+windowDaysInput.addEventListener("input", renderWindow);
+windowDaysInput.addEventListener("change", saveOptions);
+renderWindow();
 
 // ---- Rate-limit warning ---------------------------------------------------
 

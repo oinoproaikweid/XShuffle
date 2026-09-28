@@ -409,17 +409,14 @@
       return;
     }
 
-    // An explicit range from the popup wins; otherwise size the window from
-    // the account's own posting rate.
-    let windowDays = null;
-    if (options.rangeStart && options.rangeEnd) {
+    // The slider wins: it is an explicit day count from the user. An old
+    // stored date range is honoured too, by treating it as a window that many
+    // days wide. Otherwise size the window from the account's own posting rate.
+    let windowDays = options.windowDays;
+    if (windowDays === null && options.rangeStart && options.rangeEnd) {
       const start = new Date(`${options.rangeStart}T00:00:00Z`);
       const end = new Date(`${options.rangeEnd}T00:00:00Z`);
       if (Number.isFinite(start.getTime()) && Number.isFinite(end.getTime()) && start < end) {
-        // An explicit range is the user's decision, so it is not clamped to the
-        // automatic maximum - but it is split into windows no wider than
-        // MAX_WINDOW_DAYS so a single search never asks X for more than it
-        // will return.
         const span = Math.ceil((end - start) / 86400000);
         windowDays = Math.min(MAX_WINDOW_DAYS, Math.max(MIN_WINDOW_DAYS, span));
       }
@@ -462,8 +459,23 @@
 
   function sanitiseOptions(raw) {
     const options = raw && typeof raw === 'object' ? raw : {};
+    // The popup slider sends a day count, with null meaning Auto. Keep the
+    // old date-range fields working so a stored profile from an earlier
+    // version still holds its choice: an explicit range is just a window
+    // that many days wide.
+    let windowDays = Number.isFinite(options.windowDays) && options.windowDays >= MIN_WINDOW_DAYS
+      ? Math.min(MAX_WINDOW_DAYS, Math.round(options.windowDays))
+      : null;
+    if (windowDays === null && /^\d{4}-\d{2}-\d{2}$/.test(options.rangeStart || '') &&
+        /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '')) {
+      const span = Math.ceil(
+        (new Date(`${options.rangeEnd}T00:00:00Z`) - new Date(`${options.rangeStart}T00:00:00Z`)) / 86400000);
+      if (Number.isFinite(span) && span >= MIN_WINDOW_DAYS) {
+        windowDays = Math.min(MAX_WINDOW_DAYS, span);
+      }
+    }
     return {
-      windowDays: null,
+      windowDays,
       excludeReplies: options.excludeReplies === true,
       mediaOnly: options.mediaOnly === true,
       openSinglePost: options.openSinglePost === true,

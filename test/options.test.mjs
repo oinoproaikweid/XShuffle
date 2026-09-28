@@ -286,6 +286,72 @@ console.log('\nRate-limit cooldown');
   eq('only the new scan remains', w.store.local.recentScans.length, 1);
 }
 
+// -------------------------------------------------------- window slider --
+
+console.log('\nSearch window slider');
+
+{
+  // The slider sends a plain day count. It must be honoured as the window
+  // width rather than being ignored in favour of the automatic size.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { windowDays: 30 }
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
+  eq('a 30-day slider value is the window width', w.store.session[key]?.windowDays, 30);
+}
+
+{
+  // windowDays: null is Auto - the worker falls back to its own sizing.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { windowDays: null }
+  }, profileSender('https://x.com/bob'));
+  check('Auto (null) still opens a probe', !!w.log.created[0]?.url,
+    JSON.stringify(w.log.created[0]?.url));
+}
+
+{
+  // An old stored date range must still work: it becomes a window that many
+  // days wide, so an existing profile is not silently reset to Auto.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { rangeStart: '2024-01-01', rangeEnd: '2024-01-31' }
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
+  const state = w.store.session[key];
+  eq('a legacy 30-day range becomes a 30-day window', state?.windowDays, 30);
+}
+
+{
+  // Values outside the slider's range are clamped rather than trusted.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { windowDays: 5000 }
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
+  eq('an oversized window is clamped', w.store.session[key]?.windowDays, 90);
+}
+
+{
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { windowDays: 0 }
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
+  check('0 is treated as Auto, not a zero-day window',
+    (w.store.session[key]?.windowDays || 0) > 0, String(w.store.session[key]?.windowDays));
+}
+
 console.log(`\nsearch options: ${pass} passed, ${failures.length} failed`);
 if (failures.length) {
   console.log('\nfailures:');
