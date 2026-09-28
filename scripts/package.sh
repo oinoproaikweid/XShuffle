@@ -30,6 +30,13 @@ for f in "${FILES[@]}"; do
   [ -f "$f" ] || { echo "missing required file: $f" >&2; exit 1; }
   cp "$f" "$STAGE/"
 done
+# Icons live in a subdirectory, so they are staged separately from the flat
+# file list above. A manifest that names an icon the package does not carry
+# makes the browser reject the extension outright.
+if [ -d icons ]; then
+  mkdir -p "$STAGE/icons"
+  cp icons/* "$STAGE/icons/"
+fi
 
 # Refuse to ship anything the browser would choke on, or any file that is
 # neither manifest-referenced nor pulled in by the popup document.
@@ -41,6 +48,11 @@ m = json.load(open(os.path.join(stage, 'manifest.json')))
 refs = [m['background']['service_worker'], m['action']['default_popup']]
 for cs in m.get('content_scripts', []):
     refs += cs.get('js', []) + cs.get('css', [])
+# Icons are referenced by path from both the top-level icons map and the
+# action's default_icon, and they live in a subdirectory.
+icons = set(m.get('icons', {}).values())
+icons |= set(m.get('action', {}).get('default_icon', {}).values())
+refs += sorted(icons)
 
 missing = [r for r in refs if not os.path.isfile(os.path.join(stage, r))]
 if missing:
@@ -48,7 +60,7 @@ if missing:
 
 # Assets referenced from the popup HTML (stylesheets and <script src>) are
 # loaded by the browser but never named in the manifest, so follow them too.
-expected = {os.path.basename(r) for r in refs} | {'manifest.json', 'LICENSE'}
+expected = {r for r in refs} | {'manifest.json', 'LICENSE'}
 for doc in (m['action']['default_popup'],):
     html = open(os.path.join(stage, doc)).read()
     for asset in re.findall(r'(?:src|href)="([^"]+)"', html):
@@ -58,7 +70,13 @@ for doc in (m['action']['default_popup'],):
             sys.exit(f"popup references a missing asset: {asset}")
         expected.add(os.path.basename(asset))
 
-shipped = set(os.listdir(stage))
+# Compare against every shipped file, walking subdirectories, so an icon that
+# is staged but not referenced (or the reverse) is caught.
+shipped = set()
+for root, _dirs, names in os.walk(stage):
+    for name in names:
+        rel = os.path.relpath(os.path.join(root, name), stage)
+        shipped.add(rel)
 extra = shipped - expected
 if extra:
     sys.exit(f"unexpected extra files in package: {sorted(extra)}")
@@ -88,18 +106,19 @@ SRC_ZIP="$(cd "$OUT" && pwd)/xshuffle-$VERSION-src.zip"
 ( cd "$STAGE" && zip -qr "$STORE_ZIP" . -x '.*' )
 ( cd "$OUT" && zip -qr "$SRC_ZIP" "xshuffle-$VERSION" )
 
-# Both archives must pass the privacy gate, and the flat one must really be
-# flat: a store silently ignoring a nested manifest is a bad way to find out.
+# The store archive must put manifest.json at the root, but it is not fully
+# flat: an icons/ subdirectory is normal and required. Check that nothing is
+# nested deeper than that, rather than that every entry sits at the top.
 python3 - "$STORE_ZIP" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
     names = [n for n in z.namelist() if not n.endswith('/')]
 if 'manifest.json' not in names:
     sys.exit(f"store archive must have manifest.json at the root; got: {names}")
-depth = {n.count('/') for n in names}
-if len(depth) != 1:
-    sys.exit(f"store archive must be flat; got nesting: {sorted(names)}")
-print(f"  store archive is flat, manifest.json at root ({len(names)} files)")
+deep = [n for n in names if n.count('/') > 1 or (n.count('/') == 1 and not n.startswith('icons/'))]
+if deep:
+    sys.exit(f"store archive has unexpected nesting: {sorted(deep)}")
+print(f"  store archive is correctly shaped ({len(names)} files)")
 PY
 
 echo
