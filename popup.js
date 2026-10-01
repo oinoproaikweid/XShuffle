@@ -78,6 +78,52 @@ const optionFields = {
   openSinglePost: document.getElementById("opt-single-post")
 };
 
+// ---- Retry delay ---------------------------------------------------------
+//
+// A typed millisecond value rather than a slider: the useful settings are 0
+// (as fast as possible) and "long enough to stay well under a limit", and a
+// slider over that range is either mostly dead space or too coarse to aim
+// with. The worker re-validates and clamps whatever arrives, so a bad value
+// here can never wedge a scan.
+const RETRY_DELAY_DEFAULT_MS = 1000;
+const RETRY_DELAY_MAX_MS = 60000;
+const retryDelayInput = document.getElementById("opt-retry-delay");
+const retryDelayValue = document.getElementById("opt-retry-delay-value");
+const retryDelayHint = document.getElementById("retry-delay-hint");
+
+/** Clamp to what the worker accepts, so the readout matches what will happen. */
+function normaliseRetryDelay(raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return RETRY_DELAY_DEFAULT_MS;
+  return Math.min(RETRY_DELAY_MAX_MS, Math.round(value));
+}
+
+function describeDelay(ms) {
+  if (ms === 0) return "none";
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  return `${Number.isInteger(secs) ? secs : secs.toFixed(1)}s`;
+}
+
+function renderRetryDelay() {
+  const ms = normaliseRetryDelay(retryDelayInput.value);
+  retryDelayValue.textContent = describeDelay(ms);
+  retryDelayInput.setAttribute("aria-valuetext", describeDelay(ms));
+  // Explain the consequence, because 0 and 1000 are very different choices and
+  // the field itself does not convey that.
+  retryDelayHint.textContent = ms === 0
+    ? "No delay: searches fire as fast as X will answer them. Fastest, and the most likely to be rate-limited."
+    : `Waiting ${describeDelay(ms)} before each retry search. The first search is never delayed. A scan trying ${ms >= 2000 ? "many date ranges" : "several date ranges"} adds roughly ${describeDelay(ms * 29)} at worst.`;
+}
+
+retryDelayInput.addEventListener("input", renderRetryDelay);
+retryDelayInput.addEventListener("change", () => {
+  retryDelayInput.value = String(normaliseRetryDelay(retryDelayInput.value));
+  renderRetryDelay();
+  saveOptions();
+});
+renderRetryDelay();
+
 // A slider needs an "off" position, and range inputs have no natural one, so
 // Auto sits at the far left as its own step before the day counts begin.
 const AUTO_WINDOW_DAYS = 0;
@@ -102,7 +148,8 @@ function currentOptions() {
     excludeReplies: optionFields.excludeReplies.checked,
     mediaOnly: optionFields.mediaOnly.checked,
     openSinglePost: optionFields.openSinglePost.checked,
-    windowDays: windowDaysToDays(Number(windowDaysInput.value))
+    windowDays: windowDaysToDays(Number(windowDaysInput.value)),
+    retryDelayMs: normaliseRetryDelay(retryDelayInput.value)
   };
 }
 
@@ -122,7 +169,14 @@ function applyOptions(options) {
       windowDaysInput.value = String(Math.min(90, Math.max(1, span)));
     }
   }
+  // An absent or invalid stored delay keeps the default rather than showing an
+  // empty field, which would read as "unset" and save back as the default
+  // anyway - just less clearly.
+  if (Number.isFinite(Number(options.retryDelayMs))) {
+    retryDelayInput.value = String(normaliseRetryDelay(options.retryDelayMs));
+  }
   renderWindow();
+  renderRetryDelay();
 }
 
 function saveOptions() {

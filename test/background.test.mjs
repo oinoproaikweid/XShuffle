@@ -195,7 +195,8 @@ console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
   const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
   const scanId = scanTabIdOf(w);
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
-  await tick();
+  // The fallback retry waits out the default retry delay before navigating.
+  await new Promise(r => setTimeout(r, 1200));
   const fallback = decodeURIComponent(w.log.updated[w.log.updated.length - 1].url);
   const fm = windowOf(fallback);
   check('empty probe falls back to a windowed search', !!fm, fallback.slice(0, 120));
@@ -239,6 +240,9 @@ console.log('\n\x1b[1mNo-repeat guarantee\x1b[0m');
   for (let i = 0; i < 5; i++) {
     w.tabUrls[scanId] = 'https://x.com/search?q=from:dave';
     await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=from:dave', scanId));
+    // Each retry waits out the delay; without this the loop reads the previous
+    // window and the distinctness assertion is meaningless.
+    await new Promise(r => setTimeout(r, 1200));
     const g = windowOf(w.log.updated[w.log.updated.length - 1]?.url || '');
     if (g) seen.add(g[0]);
   }
@@ -309,8 +313,10 @@ async function startScan(username = 'frank', joinDate = '2023-01-01', { postCoun
   const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
   const scanId = scanTabIdOf(w);
   // The probe returns nothing, so the worker falls back to a windowed scan.
+  // That retry waits out the default retry delay before navigating, so give it
+  // time to land - reading the URL synchronously would see the probe's.
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
-  await tick();
+  await new Promise(r => setTimeout(r, 1200));
   w.tabUrls[scanId] = 'https://x.com/search?q=x';
   // The user's tab (id 1) still shows the profile the scan started from.
   w.tabUrls[1] = `https://x.com/${username}`;
@@ -487,7 +493,7 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   const before2 = JSON.parse(JSON.stringify(Object.values(w.store.session)[0]));
   const cur = before2.currentWindow;
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
-  await tick();
+  await new Promise(r => setTimeout(r, 1200));
   const state = Object.values(w.store.session)[0];
   const after = state && JSON.parse(JSON.stringify(state));
   check('a stall does not count toward widening the window',
@@ -507,7 +513,7 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
   const before = w.log.navigated.length;
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
-  await tick();
+  await new Promise(r => setTimeout(r, 1200));
   const retried = w.log.navigated.slice(before).map(u => windowOf(decodeURIComponent(u.url))).filter(Boolean).pop();
   // until: is inclusive, so the URL's last day is the day before the window's
   // exclusive end - the same conversion every other window assertion uses.
@@ -534,6 +540,7 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
     const cur = state();
     if (!cur?.currentWindow) break;
     await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
+    await new Promise(r => setTimeout(r, 1200));
     if (!state()) break;
   }
   const after = w.log.navigated.slice(before).map(u => u.url);

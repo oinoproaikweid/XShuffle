@@ -72,7 +72,9 @@ function makeWorker() {
       sendMessage: (id, msg, cb) => { log.messages.push({ id, msg }); cb && cb(); }
     }
   };
-  const sandbox = vm.createContext({ chrome, crypto: { randomUUID: () => 'tok-1' }, console, Date: FakeDate, URLSearchParams, URL, Math });
+  // setTimeout/clearTimeout are real, so the retry delay actually elapses; a
+  // sandbox without them throws as soon as a retry is delayed.
+  const sandbox = vm.createContext({ chrome, crypto: { randomUUID: () => 'tok-1' }, console, Date: FakeDate, URLSearchParams, URL, Math, setTimeout, clearTimeout });
   vm.runInContext(SRC, sandbox);
   return {
     log, store, tabUrls,
@@ -314,6 +316,10 @@ console.log('\nProbe trust');
   // whole history, so no post is chosen from it.
   check('a long-lived account does not land a post straight from the probe',
     !userNavs(w).some(u => u.includes('xs_post=')), JSON.stringify(userNavs(w)));
+  // The fall-through to a windowed search is itself a retry, so it waits out
+  // the retry delay before navigating. Without this the assertion below reads
+  // the probe's own whole-history range and calls it unbounded.
+  await new Promise(r => setTimeout(r, 1200));
   // The windowed scan reuses the scan tab rather than opening a new one, and
   // the user tab must be left alone until a post is actually found.
   const wq = queryOf(w.log.navigated[1]?.url || w.log.updated.find(u => u.id === scanId)?.url || '');

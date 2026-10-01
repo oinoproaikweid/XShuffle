@@ -13,6 +13,12 @@ import vm from 'node:vm';
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(here, '..', 'background.js'), 'utf8');
 
+// Lift the real constant out of background.js so this test cannot pass against
+// a default the extension no longer ships.
+const DEFAULT_RETRY_DELAY_MS = Number(
+  (/const\s+DEFAULT_RETRY_DELAY_MS\s*=\s*(\d+)/.exec(SRC) || [])[1]);
+
+
 let pass = 0;
 const failures = [];
 function check(name, cond, detail = '') {
@@ -91,7 +97,10 @@ function makeWorker({ today = '2026-09-28' } = {}) {
       sendMessage: (id, msg, cb) => { log.messages.push({ id, msg }); cb && cb(); }
     }
   };
-  const sandbox = vm.createContext({ chrome, crypto: { randomUUID: () => 'tok-1' }, console, Date: FakeDate, URLSearchParams, URL, Math });
+  // setTimeout/clearTimeout are real here, not the frozen clock: the retry delay
+  // is the thing under test and has to actually elapse. FakeDate only pins
+  // Date.now() for the cooldown arithmetic, which is why the two coexist.
+  const sandbox = vm.createContext({ chrome, crypto: { randomUUID: () => 'tok-1' }, console, Date: FakeDate, URLSearchParams, URL, Math, setTimeout, clearTimeout });
   vm.runInContext(SRC, sandbox);
   return {
     log, store, chrome, alarmListeners,
@@ -228,9 +237,11 @@ async function scanToPost(w, options = {}) {
   await new Promise(r => setImmediate(r));
   const probeUrl = w.log.navigated[0]?.url;
   const scanId = w.log.navigated[0].id;
-  // Empty probe -> the worker opens a windowed search in the same tab.
+  // Empty probe -> the worker opens a windowed search in the same tab. That
+  // retry now waits out the default retry delay first, so wait for the
+  // navigation to land before reading its URL back.
   await w.send({ type: 'xshuffle:scan-result', token: 'tok-1', post: null }, scanSender(probeUrl, scanId));
-  await new Promise(r => setImmediate(r));
+  await new Promise(r => setTimeout(r, DEFAULT_RETRY_DELAY_MS + 150));
   const windowUrl = w.log.updated[w.log.updated.length - 1].url;
   const m = /since:(\d{4}-\d{2}-\d{2})/.exec(decodeURIComponent(windowUrl));
   const day = m[1];
@@ -497,6 +508,95 @@ console.log('\nSearch window slider');
   const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
   check('0 is treated as Auto, not a zero-day window',
     (w.store.session[key]?.windowDays || 0) > 0, String(w.store.session[key]?.windowDays));
+}
+
+// ------------------------------------------------------------ retry delay --
+
+console.log('\nRetry delay');
+
+/** How many searches the scan has actually opened. */
+function countSearches(w) {
+  return w.log.navigated.filter(u => (u.url || '').includes('/search?')).length;
+}
+const tokenOf = w => Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
+const storedOptions = w => JSON.parse(JSON.stringify(w.store.session[Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'))])).options;
+
+{
+  // Searches inside one scan fire back to back, which is the pattern X
+  // throttles. The delay spaces them out - but only from the SECOND search on:
+  // delaying the opening probe would add dead time to a scan that may well
+  // succeed immediately, and the point is to separate requests from each other,
+  // not to stall the start.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { retryDelayMs: 150 } }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  eq('the first search is not delayed', countSearches(w), 1);
+  const at = Date.now();
+  // Not awaited: w.send resolves on its own 5ms timer, which is already longer
+  // than the instant assertion below needs. The stall case further down proves
+  // the delay holds the navigation back for real.
+  w.send({ type: 'xshuffle:scan-result', token: tokenOf(w), post: null },
+    scanSender('https://x.com/search?q=x', 1));
+  check('the second search does not fire immediately', countSearches(w) === 1,
+    `searches=${countSearches(w)} - the retry was not held back`);
+  await new Promise(r => setTimeout(r, 320));
+  check('the delayed retry eventually runs', countSearches(w) === 2, `searches=${countSearches(w)}`);
+  check('the retry waited at least the configured delay', Date.now() - at >= 150,
+    `waited ${Date.now() - at}ms, configured 150ms`);
+}
+{
+  // Zero means "no delay", a legitimate choice for someone who would rather be
+  // fast than careful. It must not become one tick, nor fall back to the default.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { retryDelayMs: 0 } }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  w.send({ type: 'xshuffle:scan-result', token: tokenOf(w), post: null },
+    scanSender('https://x.com/search?q=x', 1));
+  await new Promise(r => setImmediate(r));
+  eq('a zero delay retries immediately', countSearches(w), 2);
+}
+{
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72 },
+    profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  eq('an unset delay uses the default', storedOptions(w)?.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
+}
+{
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { retryDelayMs: 'soon' } }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  eq('a non-numeric delay falls back to the default', storedOptions(w)?.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
+}
+{
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { retryDelayMs: 99999999 } }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  check('an absurd delay is clamped', storedOptions(w)?.retryDelayMs <= 60000,
+    `stored ${storedOptions(w)?.retryDelayMs}`);
+}
+{
+  // A stall retry is the case most likely to be hammering a struggling X, so
+  // it must be delayed like any other retry rather than slipping through.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
+    postCount: 72, options: { retryDelayMs: 150 } }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  w.send({ type: 'xshuffle:scan-result', token: tokenOf(w), post: null },
+    scanSender('https://x.com/search?q=x', 1));
+  await new Promise(r => setTimeout(r, 320));
+  eq('the first retry ran', countSearches(w), 2);
+  const before = countSearches(w);
+  w.send({ type: 'xshuffle:scan-result', token: tokenOf(w), post: { stalled: true } },
+    scanSender('https://x.com/search?q=x', 1));
+  check('a stall retry is delayed too', countSearches(w) === before,
+    `searches=${countSearches(w)} - a stall retry bypassed the delay`);
+  await new Promise(r => setTimeout(r, 320));
+  eq('and the delayed stall retry then runs', countSearches(w), before + 1);
 }
 
 console.log(`\nsearch options: ${pass} passed, ${failures.length} failed`);

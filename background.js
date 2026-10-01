@@ -55,12 +55,34 @@
   const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
   const SAFETY_COOLDOWN_MS = 2 * 60 * 1000;
 
+  // Pause between searches inside one scan.
+  //
+  // A scan fires up to MAX_SCAN_WINDOWS searches in quick succession, and that
+  // burst is exactly the shape X throttles: several identical-looking searches
+  // a few hundred milliseconds apart. Spacing them out costs the user a little
+  // wall-clock time and materially reduces the chance of a limit.
+  //
+  // One second by default. Long enough to matter to a rate limiter, short
+  // enough that a thirty-window scan does not feel broken - at 1s the worst
+  // case adds about half a minute to a scan that was going to take that long
+  // anyway. It applies from the SECOND search onward: delaying the opening
+  // probe would add dead time to a scan that may well succeed immediately,
+  // since the point is to separate requests from each other, not to stall the
+  // start.
+  //
+  // Clamped so a mistyped value cannot wedge a scan open for hours. The ceiling
+  // is generous on purpose - someone deliberately spacing requests to stay well
+  // under a limit should be able to.
+  const DEFAULT_RETRY_DELAY_MS = 1000;
+  const MAX_RETRY_DELAY_MS = 60000;
+
   // User-selectable search shaping, mirrored from the popup.
   const DEFAULT_OPTIONS = {
     windowDays: null,      // null = size it automatically from posting rate
     excludeReplies: false,
     mediaOnly: false,
-    openSinglePost: false
+    openSinglePost: false,
+    retryDelayMs: DEFAULT_RETRY_DELAY_MS
   };
 
   function stateKey(token) { return `xshuffle:${token}`; }
@@ -85,6 +107,7 @@
       // silently resets to 0 mid-scan and the window never widens, which is
       // how a bursty account ends up exhausting MAX_SCAN_WINDOWS on windows
       // that were too narrow to begin with.
+      searchesStarted: state.searchesStarted || 0,
       emptyWindows: state.emptyWindows || 0,
       baseWindowDays: state.baseWindowDays ?? state.windowDays,
       options: state.options
@@ -297,7 +320,7 @@
       state.windowsTried = 1;
       persistState(state, () => {
         if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-        navigateScan(state, buildScanUrl(state, token, first.start, first.end), () => {
+        navigateScanDelayed(state, buildScanUrl(state, token, first.start, first.end), () => {
           finish(token, null, 'Could not continue searching X.');
         });
         progress(state, 'looking', first);
@@ -320,7 +343,7 @@
       state.windowsTried += 1;
       persistState(state, () => {
         if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-        navigateScan(state, buildScanUrl(state, token, same.start, same.end), () => {
+        navigateScanDelayed(state, buildScanUrl(state, token, same.start, same.end), () => {
           finish(token, null, 'Could not continue searching X.');
         });
         progress(state, 'retrying', same);
@@ -354,7 +377,7 @@
     state.currentWindow = window;
     persistState(state, () => {
       if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-      navigateScan(state, buildScanUrl(state, token, window.start, window.end), () => {
+      navigateScanDelayed(state, buildScanUrl(state, token, window.start, window.end), () => {
         finish(token, null, 'Could not continue searching X.');
       });
       progress(state, 'looking', window);
@@ -377,6 +400,38 @@
     chrome.tabs.update(state.targetTabId, { url }, () => {
       if (chrome.runtime.lastError) { onError(); return; }
     });
+  }
+
+  /**
+   * Navigate to the next search, waiting out the retry delay first.
+   *
+   * The wait lives here rather than at each call site because every search in a
+   * scan goes through this function, and a delay that only some paths honour is
+   * worse than none - it looks like protection and is not.
+   *
+   * The first search of a scan is not delayed: it is the user's first click and
+   * may well succeed, and there is no earlier request to space it away from.
+   * `searchesStarted` counts navigations, so it survives the worker being
+   * evicted mid-scan the rest of the state does.
+   *
+   * A delayed navigation still reports progress and stays cancellable by the
+   * normal timeout alarm, so a long delay cannot leave a scan hanging past the
+   * point where the alarm gives up on it.
+   */
+  function navigateScanDelayed(state, url, onError) {
+    const delay = Number(state.options?.retryDelayMs);
+    const waitMs = Number.isFinite(delay) && delay > 0 && (state.searchesStarted || 0) > 0
+      ? Math.min(delay, MAX_RETRY_DELAY_MS)
+      : 0;
+    state.searchesStarted = (state.searchesStarted || 0) + 1;
+    if (!waitMs) { navigateScan(state, url, onError); return; }
+    progress(state, 'waiting', { delayMs: waitMs });
+    setTimeout(() => {
+      // The scan may have finished or been abandoned while we waited, in which
+      // case navigating would drag the user somewhere they did not ask for.
+      if (!pending.has(state.token)) return;
+      navigateScan(state, url, onError);
+    }, waitMs);
   }
 
   // Put the user back where they started. Without this a scan that found
@@ -645,6 +700,11 @@
     // result at the end.
     persistState(state, () => {
       if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
+      // Counted here rather than only inside navigateScanDelayed, because the
+      // opening probe goes through the immediate path: without this the counter
+      // would still read 0 on the first retry and NO delay would ever apply,
+      // which is exactly the bug this option exists to prevent.
+      state.searchesStarted = (state.searchesStarted || 0) + 1;
       navigateScan(state, buildProbeUrl(state, token), () => {
         finish(token, null, 'Could not open an X search.');
       });
@@ -670,11 +730,19 @@
         windowDays = Math.min(MAX_WINDOW_DAYS, span);
       }
     }
+    // A missing, non-numeric or negative delay is the default rather than zero:
+    // silently dropping to no delay would remove the protection the user
+    // thinks they have. Zero is honoured when explicitly asked for.
+    const rawDelay = Number(options.retryDelayMs);
+    const retryDelayMs = Number.isFinite(rawDelay) && rawDelay >= 0
+      ? Math.min(MAX_RETRY_DELAY_MS, Math.round(rawDelay))
+      : DEFAULT_RETRY_DELAY_MS;
     return {
       windowDays,
       excludeReplies: options.excludeReplies === true,
       mediaOnly: options.mediaOnly === true,
       openSinglePost: options.openSinglePost === true,
+      retryDelayMs,
       rangeStart: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeStart || '') ? options.rangeStart : null,
       rangeEnd: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '') ? options.rangeEnd : null
     };

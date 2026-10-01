@@ -239,11 +239,14 @@
     excludeReplies: false,
     mediaOnly: false,
     openSinglePost: false,
-    // null means Auto: let the worker size the window from the account's
+    // null = Auto: let the worker size the window from the account's
     // posting rate rather than a fixed number of days.
     windowDays: null,
     rangeStart: '',
-    rangeEnd: ''
+    rangeEnd: '',
+    // Mirrors the worker's own default. The worker re-clamps and re-defaults
+    // regardless, so a stale or absent value here cannot produce a bad delay.
+    retryDelayMs: 1000
   };
 
   /**
@@ -263,7 +266,11 @@
       mediaOnly: options.mediaOnly === true,
       openSinglePost: options.openSinglePost === true,
       rangeStart: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeStart || '') ? options.rangeStart : '',
-      rangeEnd: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '') ? options.rangeEnd : ''
+      rangeEnd: /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '') ? options.rangeEnd : '',
+      // Passed through as typed; the worker owns validation and clamping, so
+      // duplicating the rules here would only create a second place for them
+      // to drift.
+      retryDelayMs: options.retryDelayMs
     };
   }
 
@@ -601,10 +608,16 @@
       probing: 'Reading their post history…',
       looking: 'Looking for posts…',
       retrying: 'Retrying…',
+      waiting: 'Waiting before the next search…',
       widening: 'Widening the date range…'
     };
     if (labels[message.stage]) button.textContent = labels[message.stage];
-    if (message.stage === 'looking' && message.window?.start && message.window?.end) {
+    if (message.stage === 'waiting' && message.window?.delayMs) {
+      // Say how long and why, so a deliberate pause does not read as a hang.
+      const secs = (message.window.delayMs / 1000).toFixed(1).replace(/\.0$/, '');
+      button.textContent = `Waiting ${secs}s…`;
+      button.title = 'Spacing searches out to avoid X rate-limiting you';
+    } else if (message.stage === 'looking' && message.window?.start && message.window?.end) {
       button.textContent = `Looking… ${message.window.start}`;
       button.title = `Searching ${message.window.start} through ${message.window.end} (end date excluded)`;
     } else if (labels[message.stage]) {

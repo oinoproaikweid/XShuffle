@@ -45,6 +45,13 @@
 
         <div class="xshuffle-popup-label">Rate limits</div>
 
+        <label class="xshuffle-range-field">
+          <span>Delay between searches</span>
+          <input id="opt-retry-delay" type="number" min="0" max="60000" step="100" value="1000">
+        </label>
+        <output id="opt-retry-delay-value" class="xshuffle-range-value">1s</output>
+        <div class="xshuffle-hint" id="retry-delay-hint">Milliseconds to wait before each retry search. Spacing searches out makes X rate-limiting you less likely; 0 searches as fast as possible.</div>
+
         <label class="xshuffle-check">
           <input id="opt-ignore-rate-limit" type="checkbox">
           <span>Ignore the rate-limit pause</span>
