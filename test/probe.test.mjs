@@ -136,7 +136,10 @@ console.log('\nProbe search URL');
   check('probe carries the xs_probe flag', /xs_probe=1/.test(probeUrl));
   // URLSearchParams encodes spaces in q= as '+', not %20.
   const q = new URL(probeUrl).searchParams.get('q');
-  check('probe spans join date to tomorrow', /since:2023-01-01/.test(q) && /until:2026-09-29/.test(q), q);
+  // until: is inclusive on X, so covering through today means until: today
+  // exactly. The old assertion asked for tomorrow, which searched a day that
+  // does not exist yet.
+  check('probe spans join date to tomorrow', /since:2023-01-01/.test(q) && /until:2026-09-28/.test(q), q);
   check('probe is a single search over the whole history', /from:xtestuser since:2023-01-01/.test(q), q);
 }
 
@@ -236,6 +239,32 @@ console.log('\nProbe result validation');
   const dest = [new URL(lastUserNav(w)).searchParams.get('q')];
   check('posts outside the manual range are discarded',
     dest.every(q => /since:2026-07-04/.test(q)), JSON.stringify(dest));
+}
+
+{
+  // A range end is INCLUSIVE - "1 July to 1 August" includes 1 August. The
+  // validation rejected a post dated exactly on the end, so the last day of a
+  // hand-picked range could never produce a result.
+  const { w, tok, probeUrl, scanId } = await startYoungProbe({ rangeStart: '2026-07-01', rangeEnd: '2026-07-04' });
+  w.setTabUrl(1, probeUrl);
+  const r = await w.send(
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
+    scanSender(probeUrl, scanId));
+  check('a post on the inclusive range end is accepted', r?.ok === true, JSON.stringify(r));
+  // Two of the fixture posts share 2026-07-04 and the pick is a weighted
+  // random draw, so assert the landed day rather than a specific post id.
+  check('and it is a post from the range-end day',
+    userNavs(w).some(u => /since:2026-07-04/.test(decodeURIComponent(u))), JSON.stringify(userNavs(w)));
+}
+{
+  // One day past the end is still out of range, so inclusivity does not leak.
+  const { w, tok, probeUrl, scanId } = await startYoungProbe({ rangeStart: '2026-07-01', rangeEnd: '2026-07-03' });
+  w.setTabUrl(1, probeUrl);
+  await w.send(
+    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
+    scanSender(probeUrl, scanId));
+  check('a post one day past the range end is still discarded',
+    !userNavs(w).some(u => /xs_post=/.test(decodeURIComponent(u))), JSON.stringify(userNavs(w)));
 }
 
 console.log('\nProbe distribution');

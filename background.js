@@ -151,8 +151,32 @@
     return parts.length ? ` ${parts.join(' ')}` : '';
   }
 
-  function buildScanUrl(state, token, start, end, probe = false) {
-    const query = `from:${state.username} since:${start} until:${end}${filterClause(state.options)}`;
+  /**
+   * Build a search URL for an INCLUSIVE date span.
+   *
+   * start and end are both inclusive days. X's `until:` operator is itself
+   * inclusive of the day written after it, so until:end returns posts made on
+   * `end` - not the day before. Every caller here was written against the
+   * opposite assumption, which meant each search asked for one day beyond the
+   * span it meant to cover and then discarded the result:
+   *
+   *   - a scan window whose last in-range day was `end - 1` still asked for
+   *     `until:end`, so that final day came back from X and was then rejected
+   *     by the out-of-window check. On a 1-day window that is every window,
+   *     which is how a busy account ends up reported as having no visible
+   *     posts when it plainly does.
+   *   - the daily search for the chosen post asked for until:day+1, so the
+   *     page the user landed on showed two days instead of one.
+   *   - the probe ran until:tomorrow, one day past today.
+   *
+   * Converting the exclusive end the callers hold into an inclusive one is
+   * done here, once, so no caller can get it wrong again.
+   */
+  function buildScanUrl(state, token, start, endExclusive, probe = false) {
+    // The caller passes the first day past the span; until: is inclusive, so
+    // the day to ask for is the one before it.
+    const endInclusive = new Date(new Date(`${endExclusive}T00:00:00Z`).getTime() - 86400000);
+    const query = `from:${state.username} since:${start} until:${formatDate(endInclusive)}${filterClause(state.options)}`;
     const params = new URLSearchParams({
       q: query,
       src: 'typed_query',
@@ -164,25 +188,42 @@
     return `https://x.com/search?${params.toString()}`;
   }
 
+  /**
+   * The user's range end, as the exclusive bound the scan works in.
+   *
+   * A range the user typed or picked is INCLUSIVE of both ends - asking for
+   * 1st to 31st means both the 1st and the 31st. The scan works in exclusive
+   * bounds internally, so the end is pushed out by a day here rather than at
+   * each use, which is where the last day of a hand-picked range kept going
+   * missing.
+   */
+  function rangeEndExclusive(options) {
+    const rangeEnd = options?.rangeEnd;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(rangeEnd || '')) return tomorrowUtc();
+    const parsed = new Date(`${rangeEnd}T00:00:00Z`);
+    if (!Number.isFinite(parsed.getTime())) return tomorrowUtc();
+    return formatDate(new Date(parsed.getTime() + 86400000));
+  }
+
   /** One search across the account's entire history, to learn its real post days. */
   function buildProbeUrl(state, token) {
     const options = state.options || {};
     const start = options.rangeStart || state.joinDate;
-    // Search is inclusive of the start day and exclusive of the end, so ask
-    // through tomorrow to cover today.
-    const end = options.rangeEnd || tomorrowUtc();
+    // buildScanUrl takes an exclusive end, and the probe covers every day up
+    // to and including today - or up to and including a hand-picked range end.
+    const end = rangeEndExclusive(options);
     return buildScanUrl(state, token, start, end, true);
   }
 
   function chooseScanWindow(state) {
     const windowDays = state.windowDays || MAX_WINDOW_DAYS;
     // A manual range bounds the search outright; otherwise the whole span from
-    // the join date to today is fair game.
+    // the join date to today is fair game. rangeEndExclusive turns the user's
+    // inclusive end date into the exclusive bound the window maths needs.
     const options = state.options || {};
     const rangeStart = options.rangeStart ? new Date(`${options.rangeStart}T00:00:00Z`) : null;
-    const rangeEnd = options.rangeEnd ? new Date(`${options.rangeEnd}T00:00:00Z`) : null;
     const join = rangeStart || new Date(`${state.joinDate}T00:00:00Z`);
-    const tomorrow = rangeEnd || new Date(`${tomorrowUtc()}T00:00:00Z`);
+    const tomorrow = new Date(`${rangeEndExclusive(options)}T00:00:00Z`);
     if (!(tomorrow > join)) return null;
     const totalDays = Math.max(1, Math.ceil((tomorrow - join) / 86400000));
     const totalWindows = Math.ceil(totalDays / windowDays);
@@ -300,9 +341,11 @@
   }
 
   function buildDailySearchUrl(state, post) {
-    const date = new Date(`${post.day}T00:00:00Z`);
-    const next = new Date(date.getTime() + 86400000);
-    const query = `from:${state.username} since:${post.day} until:${formatDate(next)}${filterClause(state.options)}`;
+    // until: is inclusive, so the single day asked for is the post's own day.
+    // Asking for the next day returned that day's posts too, so the page the
+    // user landed on after a successful shuffle showed more than the post they
+    // picked.
+    const query = `from:${state.username} since:${post.day} until:${post.day}${filterClause(state.options)}`;
     const params = new URLSearchParams({
       q: query,
       src: 'typed_query',
@@ -398,8 +441,18 @@
       // The search ran in the user's tab, so a miss would otherwise leave them
       // on the last empty date range. Go back to the profile they started from
       // before reporting, so a failed shuffle ends where a successful one does.
-      returnToProfile(state);
-      respond(state, { ok: false, message: message || 'X search found no visible posts for this account.' });
+      //
+      // But only if the tab is still where this scan put it. The success path
+      // already refuses to move a user who navigated away mid-scan; the
+      // failure path has to honour the same rule, because being yanked back to
+      // the profile you started from is the most disruptive thing this
+      // extension can do to someone who has already moved on - worse than
+      // leaving them on an empty search page, which is at least honest about
+      // what happened.
+      chrome.tabs.get(state.targetTabId, target => {
+        if (!chrome.runtime.lastError && stillOurs(state, target?.url)) returnToProfile(state);
+        respond(state, { ok: false, message: message || 'X search found no visible posts for this account.' });
+      });
       return;
     }
 
@@ -429,14 +482,18 @@
     });
   }
 
-  // True when the tab is still showing a search for the account being shuffled.
-  // Anything else - a different profile, an unrelated page, a permalink the
-  // user opened themselves - means the user has taken over and the scan should
-  // report rather than navigate.
+  // True when the tab is still showing a search for the account being shuffled,
+  // or the profile it started from. Anything else - a different profile, an
+  // unrelated page, a permalink the user opened themselves - means the user
+  // has taken over and the scan should report rather than navigate.
+  //
+  // The source profile counts as ours because the scan may not have navigated
+  // the tab yet (a miss before the first search completes), and because the
+  // return-to-profile on failure has to be allowed to put the user back there.
   function stillOurs(state, url) {
     if (typeof url !== 'string' || !url.startsWith('https://x.com/')) return false;
-    if (!state.currentWindow && !url.includes('/search?')) return false;
-    return tabUsername(url) === String(state.username).toLowerCase();
+    if (tabUsername(url) === String(state.username).toLowerCase()) return true;
+    return false;
   }
 
   function startDiscovery(message, sender, sendResponse) {
@@ -590,7 +647,8 @@
           if (!Number.isFinite(parsedDay.getTime()) || formatDate(parsedDay) !== post.day) return false;
           if (parsedDay < parsedJoin || parsedDay > todayUtc) return false;
           if (rangeStart && parsedDay < rangeStart) return false;
-          if (rangeEnd && parsedDay >= rangeEnd) return false;
+          // The user's range end is inclusive, so a post ON it is in range.
+          if (rangeEnd && parsedDay > rangeEnd) return false;
           return true;
         });
         if (!valid.length) {

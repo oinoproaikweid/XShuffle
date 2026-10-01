@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import vm from 'node:vm';
+import { extractFunction, backgroundSrc } from './harness.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(here, '..', 'background.js'), 'utf8');
@@ -324,11 +325,13 @@ async function startScan(username = 'frank', joinDate = '2023-01-01', { postCoun
   check('accepts a valid in-window post', r?.ok === true, JSON.stringify(r));
   const dest = w.log.updated.map(u => decodeURIComponent(u.url)).find(u => u.includes('xs_post=1234567890'));
   check('navigates to the one-day search', !!dest);
+  // until: is inclusive on X, so a single day is until equal to since. The
+  // old assertion demanded a 86400000 gap, which is a two-day search.
   check('daily search is exactly 1 day', !!dest && (() => {
     const g = windowOf(dest);
     if (!g) return false;
-    return (new Date(g[2] + 'T00:00:00Z') - new Date(g[1] + 'T00:00:00Z')) === 86400000;
-  })());
+    return g[1] === g[2];
+  })(), dest ? windowOf(dest).slice(1).join('..') : 'no window');
   check('closes no tab on success', w.log.removed.length === 0, JSON.stringify(w.log.removed));
   check('lands the user on the daily search',
     w.log.navigated.some(u => decodeURIComponent(u.url).includes('xs_post=1234567890')), '');
@@ -354,6 +357,97 @@ for (const [label, build] of postBad) {
   const far = new Date(new Date(cur.end + 'T00:00:00Z').getTime() + 8 * 86400000).toISOString().slice(0, 10);
   const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '42', day: far } }, scanSender('https://x.com/search?q=x', scanId));
   check('rejects post outside the active window', r?.ok === false, `day=${far} window=${cur.start}..${cur.end}`);
+}
+
+// ------------------------------------------------------- scan window bounds
+
+console.log('\n\x1b[1mScan window bounds (until: is inclusive on X)\x1b[0m');
+/**
+ * X's `until:` operator is INCLUSIVE of the date given - until:2024-03-31
+ * returns posts made on 31 March. The window builder treats its end as
+ * EXCLUSIVE (it builds the next window starting exactly there, and validates
+ * results with `day >= end` rejected).
+ *
+ * That mismatch means every window's final day is searched but then thrown
+ * away by validation: the content script extracts the post, the worker
+ * rejects it as out-of-window, and the scan burns a window for nothing. On a
+ * 1-day window it is every window. These tests pin the two halves together:
+ * the URL asked for must cover exactly the days validation accepts.
+ */
+{
+  const { w, tok, scanId } = await startScan('kate', '2023-01-01');
+  const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  // The URL the worker actually searched for this window.
+  const searched = w.log.navigated.map(u => decodeURIComponent(u.url)).map(windowOf).filter(Boolean).pop();
+  check('the searched range covers the window start', searched?.[1] === cur.start,
+    `searched since=${searched?.[1]} window start=${cur.start}`);
+  // until: is inclusive, so the day asked for last must be the day validation
+  // accepts last. Asking for cur.end itself returns cur.end, which validation
+  // rejects - the dropped-day bug.
+  const askedLast = searched?.[2];
+  const acceptsLast = new Date(new Date(cur.end + 'T00:00:00Z').getTime() - 86400000).toISOString().slice(0, 10);
+  check('the last day searched is a day validation accepts',
+    askedLast === acceptsLast,
+    `asked until:${askedLast} but accepts up to ${acceptsLast} (window ${cur.start}..${cur.end})`);
+}
+{
+  // A post on the last day the URL actually returned must be accepted, not
+  // rejected as out-of-window. This is the user-visible miss.
+  const { w, tok, scanId } = await startScan('liam', '2023-01-01');
+  const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  const lastAccepted = new Date(new Date(cur.end + 'T00:00:00Z').getTime() - 86400000).toISOString().slice(0, 10);
+  const r = await w.send(
+    { type: 'xshuffle:scan-result', token: tok, post: { id: '555', day: lastAccepted } },
+    scanSender('https://x.com/search?q=x', scanId));
+  check('accepts a post on the window\'s final in-range day', r?.ok === true,
+    `day=${lastAccepted} window=${cur.start}..${cur.end} response=${JSON.stringify(r)}`);
+}
+{
+  // Windows must tile the span with no gap and no overlap, or days go
+  // unsearched (missing results) or searched twice (wasted rate limit).
+  const chooseSrc = [
+    extractFunction(backgroundSrc, 'formatDate'),
+    extractFunction(backgroundSrc, 'tomorrowUtc'),
+    extractFunction(backgroundSrc, 'rangeEndExclusive'),
+    extractFunction(backgroundSrc, 'chooseScanWindow'),
+    'const MIN_WINDOW_DAYS = 1, MAX_WINDOW_DAYS = 90;',
+  ].join('\n');
+  const chooseScanWindow = new Function(`${chooseSrc}\nreturn chooseScanWindow;`)();
+  // One state, shared: triedWindows is what stops a window being drawn twice,
+  // so resetting it per draw would just re-roll the same windows.
+  const state = {
+    username: 'u', joinDate: '2020-01-01', windowDays: 7, options: {},
+    triedWindows: new Set(),
+  };
+  const covered = new Set();
+  let overlaps = 0;
+  let drawn = 0;
+  for (let i = 0; i < 400; i++) {
+    const win = chooseScanWindow(state);
+    if (!win) break;
+    drawn++;
+    for (let t = Date.parse(win.start + 'T00:00:00Z'); t < Date.parse(win.end + 'T00:00:00Z'); t += 86400000) {
+      if (covered.has(t)) overlaps++;
+      covered.add(t);
+    }
+  }
+  // The extracted function builds its own "tomorrow" from the real clock, so
+  // the expected window count is derived from the same clock rather than
+  // hardcoded against the harness's frozen date.
+  const realTomorrow = new Date();
+  realTomorrow.setUTCHours(0, 0, 0, 0);
+  realTomorrow.setUTCDate(realTomorrow.getUTCDate() + 1);
+  const spanDays = Math.ceil((realTomorrow - new Date('2020-01-01T00:00:00Z')) / 86400000);
+  check('every window in the span is drawable', drawn === Math.ceil(spanDays / 7), `drew ${drawn} windows, span ${spanDays} days`);
+  check('windows never overlap each other', overlaps === 0, `${overlaps} overlapping days`);
+  // The join date up to tomorrow is the whole span; every day in it must be
+  // reachable by some window.
+  const spanStart = Date.parse('2020-01-01T00:00:00Z');
+  const spanEnd = realTomorrow.getTime();
+  let missing = 0;
+  for (let t = spanStart; t < spanEnd; t += 86400000) if (!covered.has(t)) missing++;
+  check('every day of the account lifetime is covered by some window', missing === 0,
+    `${missing} days unreachable across 400 draws`);
 }
 
 // ------------------------------------------------------------ redirect guard
@@ -382,6 +476,31 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '9', day } }, scanSender('https://x.com/search?q=x', scanId));
   check('still allows the result on the same account search page', w.log.updated.length > 0);
 }
+{
+  // The success path is guarded by stillOurs so a user who navigated away
+  // keeps the page they chose. The failure path was not: any miss that ended
+  // the scan called returnToProfile unconditionally, yanking a user off
+  // whatever they had moved to and putting them back on the profile the
+  // shuffle started from. Exhausting the scan budget is one such ending.
+  const { w, tok, scanId } = await startScan('judy2', '2023-01-01');
+  w.tabUrls[1] = 'https://x.com/someoneelse';           // user moved on during the scan
+  const before = w.log.navigated.length;
+  // Burn the whole scan budget with empty windows, then send the result that
+  // exhausts it - that is the call that reports "no visible posts".
+  const state = () => {
+    const entry = Object.values(w.store.session)[0];
+    return entry ? JSON.parse(JSON.stringify(entry)) : null;
+  };
+  for (let i = 0; i < 40; i++) {
+    const cur = state();
+    if (!cur?.currentWindow) break;
+    await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
+    if (!state()) break;
+  }
+  const after = w.log.navigated.slice(before).map(u => u.url);
+  check('a failed scan does not drag a user who navigated away back to the profile',
+    !after.includes('https://x.com/judy2'), JSON.stringify(after.slice(-4)));
+}
 
 // ------------------------------------------------------------------- timeouts
 
@@ -390,6 +509,9 @@ console.log('\n\x1b[1mTimeout\x1b[0m');
   const w = makeWorker();
   await w.send({ type: 'xshuffle:discover', username: 'judy', joinDate: '2023-01-01', requestId: 1 }, profileSender('https://x.com/judy', 1));
   check('arms a 90s alarm', w.log.alarms.some(a => a.name.startsWith('xshuffle-timeout:')));
+  // When the alarm fires the tab is on the probe search the scan navigated it
+  // to, so returning the user to the profile is correct here.
+  w.tabUrls[1] = 'https://x.com/search?q=from%3Ajudy';
   const name = w.log.alarms[0].name;
   w.fireAlarm(name);
   await new Promise(r => setTimeout(r, 5));
