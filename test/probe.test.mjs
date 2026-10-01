@@ -146,7 +146,9 @@ console.log('\nProbe search URL');
 {
   const { probeUrl } = await startProbe({ excludeReplies: true, mediaOnly: true });
   const q = queryOf(probeUrl);
-  check('probe carries the reply filter', /filter:replies/.test(q), q);
+  // Matched with the negation included: a bare /filter:replies/ also matches
+  // inside -filter:replies, so it cannot tell the two apart.
+  check('probe carries the negated reply filter', /-filter:replies/.test(q), q);
   check('probe carries the media filter', /filter:media/.test(q), q);
 }
 

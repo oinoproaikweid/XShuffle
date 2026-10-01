@@ -126,9 +126,15 @@ console.log('\nSearch filters');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
     postCount: 72, options: { excludeReplies: true }
   }, profileSender('https://x.com/bob'));
-  check('excludeReplies adds filter:replies', /filter:replies/.test(queryOf(w.log.navigated[0]?.url)),
-    queryOf(w.log.navigated[0]?.url));
-  check('excludeReplies alone adds no media filter', !/filter:media/.test(queryOf(w.log.navigated[0]?.url)));
+  const q = queryOf(w.log.navigated[0]?.url);
+  // X's filter: operators are ALLOW lists, not deny lists. Bare
+  // `filter:replies` means "only replies" - the exact opposite of hiding them,
+  // which is why the Hide replies toggle appeared to do nothing (or made
+  // results worse). Excluding requires the `-` negation prefix.
+  check('excludeReplies negates the replies filter', /-filter:replies/.test(q), q);
+  check('excludeReplies never emits a bare filter:replies',
+    !/(^|\s)filter:replies/.test(q), q);
+  check('excludeReplies alone adds no media filter', !/filter:media/.test(q));
 }
 
 {
@@ -147,7 +153,8 @@ console.log('\nSearch filters');
     postCount: 72, options: { excludeReplies: true, mediaOnly: true }
   }, profileSender('https://x.com/bob'));
   const q = queryOf(w.log.navigated[0]?.url);
-  check('both filters combine', /filter:replies/.test(q) && /filter:media/.test(q), q);
+  check('both filters combine with the correct polarity',
+    /-filter:replies/.test(q) && /filter:media/.test(q), q);
   check('filters sit after the date bounds', q.indexOf('until:') < q.indexOf('filter:'), q);
 }
 

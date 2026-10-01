@@ -143,10 +143,26 @@
     return Math.min(MAX_WINDOW_DAYS, Math.max(MIN_WINDOW_DAYS, Math.round(days)));
   }
 
-  /** Extra X search operators requested by the user. */
+  /**
+   * Extra X search operators requested by the user.
+   *
+   * X's `filter:` operators are ALLOW lists, not deny lists: bare
+   * `filter:replies` means "only replies" and `filter:media` means "only
+   * media". So the two toggles need opposite polarity, and the distinction is
+   * easy to get backwards because they look symmetric:
+   *
+   *   - Hide replies is an EXCLUSION, so it negates: `-filter:replies`.
+   *     Emitting the bare operator asked X for replies and nothing else, so
+   *     the toggle did not merely fail to hide replies - it hid everything
+   *     that was not a reply.
+   *   - Media only is an INCLUSION, so it stays positive: `filter:media`.
+   *
+   * The negation must stay attached to the operator (`-filter:replies`), since
+   * X parses the leading `-` as part of the token.
+   */
   function filterClause(options) {
     const parts = [];
-    if (options?.excludeReplies) parts.push('filter:replies');
+    if (options?.excludeReplies) parts.push('-filter:replies');
     if (options?.mediaOnly) parts.push('filter:media');
     return parts.length ? ` ${parts.join(' ')}` : '';
   }
