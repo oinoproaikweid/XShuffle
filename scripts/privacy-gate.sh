@@ -23,7 +23,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --files)    shift; while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do SCAN_FILES+=("$1"); shift; done ;;
     --archive)  shift; while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do SCAN_ARCHIVES+=("$1"); shift; done ;;
-    --history)  shift; SCAN_HISTORY="${1:-HEAD}" ;;
+    # The ref has to be consumed as well as read, or it survives the shift and
+    # falls through to the unknown-argument case below. --history therefore
+    # failed for every value, which meant the history scope silently never ran
+    # - including in release.sh, where it is supposed to be mandatory.
+    --history)  shift; SCAN_HISTORY="${1:-HEAD}"; if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then shift; fi ;;
     -h|--help)  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
