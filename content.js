@@ -21,6 +21,9 @@
   let warnedFor = '';
   const discoveryToken = new URLSearchParams(location.search).get('xs_scan');
   let discoveryReported = false;
+  // True only while the page's current report is a retractable stall. See
+  // unstall() - this is what lets a slow page still deliver its results.
+  let discoveryStalled = false;
   let discoveryQuery = location.search;
   let discoveryTimeout;
   let focusedPostId = '';
@@ -480,14 +483,36 @@
   // worker retries the SAME window rather than a new one: the window was never
   // disproven, so there is nothing to widen or re-stratify, and retrying it
   // costs exactly the one attempt a genuinely new window would have cost.
+  //
+  // Crucially the stall is a PROVISIONAL report. A slow page is not a page that
+  // will never render, and reporting "stalled" used to latch discoveryReported
+  // permanently - so posts that appeared a second later were read by nobody.
+  // The page visibly showed results, the worker had already been told the
+  // window was stalled, and it was retried for nothing. unstall() therefore
+  // re-opens reporting for the rest of this page's life, and the worker treats
+  // a late result as authoritative: a scan that has already moved on ignores
+  // it, so re-reporting is safe rather than a second scan.
   function reportDiscovery(result) {
     if (!discoveryToken || discoveryReported) return;
     discoveryReported = true;
+    // A stall is the one report that can be taken back, so record that it was
+    // a stall rather than a verdict on the window.
+    discoveryStalled = result?.stalled === true;
     chrome.runtime.sendMessage({
       type: 'xshuffle:scan-result',
       token: discoveryToken,
       post: result
     }, () => void chrome.runtime.lastError);
+  }
+
+  // Allow a later, better report from this same page. Only meaningful after a
+  // stall: a page that produced posts or a confirmed empty result has already
+  // said everything it is going to say, and re-reading it on every mutation
+  // would report the same window repeatedly.
+  function unstall() {
+    if (!discoveryStalled) return;
+    discoveryStalled = false;
+    discoveryReported = false;
   }
 
   // Shared by the initial arm and every route change, so the two cannot drift.
@@ -497,7 +522,16 @@
   }
 
   function scanDiscoveryResults() {
-    if (!discoveryToken || discoveryReported) return;
+    if (!discoveryToken) return;
+    // Late results on a page already reported as stalled: retract the stall so
+    // this scan can report the posts that are actually on screen. This has to
+    // come BEFORE the discoveryReported check, or a stalled page would return
+    // here and never re-read itself - which is the bug.
+    //
+    // The worker ignores a result for a scan it has moved on from, so this
+    // cannot start a second scan; it can only rescue the one already running.
+    unstall();
+    if (discoveryReported) return;
     const context = getSearchContext();
     const primary = document.querySelector(SELECTORS.primary);
     if (!context || !primary) return;

@@ -513,6 +513,81 @@ async function clickAndReply(response) {
     `text="${btn.textContent}" disabled=${btn.disabled}`);
 }
 
+// ------------------------------------------- a stall must not be the last word
+
+console.log('\n\x1b[1mLate results after a stall\x1b[0m');
+
+/**
+ * Render results into an already-loaded page and let the observer see them.
+ *
+ * The fixture strings are static literals defined in this file, never user
+ * input, so inserting them as markup is safe here.
+ */
+async function addPosts(dom, html) {
+  const primary = dom.window.document.querySelector('[data-testid="primaryColumn"]');
+  primary.insertAdjacentHTML('beforeend', html);
+  await new Promise(r => setTimeout(r, 60));
+}
+const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
+  '<time datetime="2024-05-02T10:00:00Z">May 2</time></a></article>';
+
+{
+  // The bug this pins: reportDiscovery() latches discoveryReported on the
+  // FIRST report, so once the discovery timeout fires as a stall, results that
+  // render a moment later are never read. The page visibly showed posts, the
+  // worker was told "stalled", and the window was retried for no reason.
+  //
+  // Driven through the real timeout, shortened by patching the constant so the
+  // test does not have to wait 35 seconds.
+  const fast = SRC.replace(
+    /const DISCOVERY_TIMEOUT_MS = \d+;/,
+    'const DISCOVERY_TIMEOUT_MS = 60;');
+  const dom = new JSDOM(searchPage([], { toolbar: true }), {
+    url: scanUrl(), runScripts: 'outside-only', pretendToBeVisual: true });
+  Object.defineProperty(dom.window.Element.prototype, 'innerText', {
+    get() { return this.textContent; }, set(v) { this.textContent = v; }, configurable: true });
+  const sent = [];
+  const store = { showShuffleUI: true, profileCache: { frank: { joinDate: '2023-01-01', postCount: 1200, seen: 1 } } };
+  dom.window.chrome = {
+    runtime: {
+      lastError: undefined,
+      onMessage: { addListener() {} },
+      sendMessage: (m, cb) => { sent.push(m); cb && cb({ ok: true }); },
+    },
+    storage: {
+      local: {
+        get: (d, cb) => {
+          const r = {};
+          if (typeof d === 'string') r[d] = store[d];
+          else for (const k of Object.keys(d)) r[k] = k in store ? store[k] : d[k];
+          cb(r);
+        },
+        set: v => { Object.assign(store, v); }, remove() {},
+      },
+      onChanged: { addListener() {} },
+    },
+  };
+  withToolbarGeometry(dom);
+  dom.window.eval(fast);
+  await new Promise(r => setTimeout(r, 20));
+  // Let the shortened discovery timeout fire: a stall is reported.
+  await new Promise(r => setTimeout(r, 150));
+  const afterStall = sent.filter(m => m.type === 'xshuffle:scan-result');
+  check('a stall is reported when nothing renders',
+    afterStall.length === 1 && afterStall[0].post?.stalled === true,
+    JSON.stringify(afterStall.map(m => m.post)));
+  // Now the results render, as they would on a slow connection.
+  await addPosts(dom, ONE_POST);
+  await new Promise(r => setTimeout(r, 120));
+  const all = sent.filter(m => m.type === 'xshuffle:scan-result');
+  const real = all.filter(m => !m.post?.stalled).map(m => m.post);
+  check('results arriving after a stall are still reported',
+    real.length === 1, `reports=${all.length} non-stall=${real.length}: ${JSON.stringify(all.map(m => m.post))}`);
+  check('and the later report carries the post that was on screen',
+    real[0]?.id === '123', JSON.stringify(real[0]));
+  dom.window.close();
+}
+
 // ------------------------------------------------------------------ summary
 
 console.log(`\n\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);
