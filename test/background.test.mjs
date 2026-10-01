@@ -170,8 +170,13 @@ const formatDay = d => d.toISOString().slice(0, 10);
 console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
 {
   // The first tab opened is the probe: one search across the whole history.
+  //
+  // The join date is recent on purpose. A probe is only opened when one page of
+  // results could plausibly span the account's life, so an old join date now
+  // skips the probe entirely - which is the behaviour asserted further down.
+  const YOUNG_JOIN = '2026-08-01';
   const w = makeWorker();
-  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72 }, profileSender('https://x.com/bob', 1));
+  w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: YOUNG_JOIN, requestId: 1, postCount: 72 }, profileSender('https://x.com/bob', 1));
   await tick();
   const url = decodeURIComponent(w.log.navigated[0].url);
   const m = windowOf(url);
@@ -179,9 +184,11 @@ console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
   check('probe is flagged so the page returns every post', /xs_probe=1/.test(url), url.slice(0, 120));
   if (m) {
     const s = new Date(m[1] + 'T00:00:00Z'), e = new Date(m[2] + 'T00:00:00Z');
-    check('probe starts at the join date', formatDay(s) === '2023-01-01', formatDay(s));
+    check('probe starts at the join date', formatDay(s) === YOUNG_JOIN, formatDay(s));
+    check('probe reaches up to today',
+      formatDay(e) === '2026-09-28', formatDay(e));
     check('probe covers the whole account lifetime',
-      Math.round((e - s) / 86400000) > 1000, `${Math.round((e - s) / 86400000)} days`);
+      Math.round((e - s) / 86400000) > 40, `${Math.round((e - s) / 86400000)} days`);
   }
   // Same here: the probe is a visible search in the user's tab, not a
   // background one, and it must not create a tab of its own.
@@ -506,7 +513,7 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   // three stalls in a row would widen the window off pages that never
   // rendered. The stall is therefore retried on the SAME window and must not
   // touch emptyWindows.
-  const { w, tok, scanId } = await startScan('nina', '2020-01-01');
+  const { w, tok, scanId } = await startScan('nina', '2026-08-01');
   const before2 = JSON.parse(JSON.stringify(Object.values(w.store.session)[0]));
   const cur = before2.currentWindow;
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
@@ -526,7 +533,7 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   // The retry must re-search the SAME window, not draw a new one - the window
   // was never disproven, so searching a different range would skip over days
   // that might hold the post.
-  const { w, tok, scanId } = await startScan('oscar', '2020-01-01');
+  const { w, tok, scanId } = await startScan('oscar', '2026-08-01');
   const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
   const before = w.log.navigated.length;
   await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
@@ -647,6 +654,54 @@ console.log('\n\x1b[1mA late post from a superseded window\x1b[0m');
     scanSender('https://x.com/search?q=x', scanId));
   check('the scan still finds a post in its current window', r?.ok === true,
     `response=${JSON.stringify(r)}`);
+}
+
+console.log('\n\x1b[1mSkipping a probe that cannot be trusted\x1b[0m');
+/**
+ * The probe is the FIRST navigation out of the profile, so when its result is
+ * going to be discarded anyway the user watches a page load and get thrown away
+ * on every single shuffle. That is the "the very first redirect always skips"
+ * symptom, and it is deterministic rather than intermittent because it depends
+ * only on the account's age.
+ *
+ * spanDays comes from the join date, which the scan already has before opening
+ * any search - so the worker can know in advance.
+ */
+{
+  // An account older than PROBE_TRUST_DAYS can never have its probe trusted:
+  // one page of results cannot plausibly span the lifetime.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'ancient', joinDate: '2015-01-01', requestId: 1, postCount: 9000 },
+    profileSender('https://x.com/ancient', 1));
+  await new Promise(r => setImmediate(r));
+  const first = decodeURIComponent(w.log.navigated[0]?.url || '');
+  check('a long-lived account does not open a probe at all', !/xs_probe=1/.test(first),
+    `first navigation was a probe: ${first.slice(0, 110)}`);
+  check('it goes straight to a bounded date window',
+    /since:\d{4}-\d{2}-\d{2}/.test(first) && /until:\d{4}-\d{2}-\d{2}/.test(first),
+    first.slice(0, 110));
+}
+{
+  // A young account keeps the probe: one page could span its whole life, and
+  // the probe usually succeeds immediately, which is the fast path worth having.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'young', joinDate: '2026-06-01', requestId: 1, postCount: 40 },
+    profileSender('https://x.com/young', 1));
+  await new Promise(r => setImmediate(r));
+  const first = decodeURIComponent(w.log.navigated[0]?.url || '');
+  check('a young account still opens the probe', /xs_probe=1/.test(first),
+    `expected a probe, got: ${first.slice(0, 110)}`);
+}
+{
+  // Exactly at the boundary the probe is still trusted, so it must still run.
+  const w = makeWorker();
+  const boundary = new Date(Date.UTC(2026, 8, 28) - 120 * 86400000).toISOString().slice(0, 10);
+  w.send({ type: 'xshuffle:discover', username: 'edge', joinDate: boundary, requestId: 1, postCount: 20 },
+    profileSender('https://x.com/edge', 1));
+  await new Promise(r => setImmediate(r));
+  const first = decodeURIComponent(w.log.navigated[0]?.url || '');
+  check('at exactly the trust limit the probe still runs', /xs_probe=1/.test(first),
+    `joinDate=${boundary} first=${first.slice(0, 110)}`);
 }
 
 // ------------------------------------------------------------------- summary

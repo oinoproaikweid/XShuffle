@@ -475,6 +475,10 @@ console.log('\nSearch window slider');
 {
   // An old stored date range must still work: it becomes a window that many
   // days wide, so an existing profile is not silently reset to Auto.
+  // 1 to 31 January inclusive is 31 days. The name of this test used to say
+  // "30-day" and asserted 30, which was the off-by-one: the window is
+  // [start, start + windowDays), so 30 covered only to 30 January and the 31st
+  // was never searched.
   const w = makeWorker();
   w.send({
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
@@ -483,7 +487,7 @@ console.log('\nSearch window slider');
   await new Promise(r => setImmediate(r));
   const key = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:'));
   const state = w.store.session[key];
-  eq('a legacy 30-day range becomes a 30-day window', state?.windowDays, 30);
+  eq('a 1-to-31 January range becomes a 31-day window', state?.windowDays, 31);
 }
 
 {

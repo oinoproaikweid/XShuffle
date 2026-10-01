@@ -97,7 +97,19 @@ const profileSender = (url, id = 1) => ({ tab: { id, url } });
 const scanSender = (url, id = 500) => ({ url, tab: { id, url } });
 const queryOf = url => new URL(url).searchParams.get('q');
 
-async function startProbe(options = {}, joinDate = '2023-01-01') {
+/**
+ * Default join date is deliberately recent.
+ *
+ * A probe is only opened when one page of results could plausibly span the
+ * account's whole life (PROBE_TRUST_DAYS). Against this file's frozen clock of
+ * 2026-09-28 that means a join date within 120 days, so the default sits well
+ * inside the window. An older date no longer opens a probe at all - which is
+ * asserted in test/background.test.mjs, not here, since this file is about what
+ * the probe does once it is running.
+ */
+const PROBE_JOIN_DEFAULT = '2026-06-01';
+
+async function startProbe(options = {}, joinDate = PROBE_JOIN_DEFAULT) {
   const w = makeWorker();
   w.send({ type: 'xshuffle:discover', username: 'xtestuser', joinDate, requestId: 1, postCount: 72, options },
     profileSender('https://x.com/xtestuser'));
@@ -141,8 +153,10 @@ console.log('\nProbe search URL');
   // until: is inclusive on X, so covering through today means until: today
   // exactly. The old assertion asked for tomorrow, which searched a day that
   // does not exist yet.
-  check('probe spans join date to tomorrow', /since:2023-01-01/.test(q) && /until:2026-09-28/.test(q), q);
-  check('probe is a single search over the whole history', /from:xtestuser since:2023-01-01/.test(q), q);
+  check('probe spans join date to today',
+    new RegExp(`since:${PROBE_JOIN_DEFAULT}`).test(q) && /until:2026-09-28/.test(q), q);
+  check('probe is a single search over the whole history',
+    new RegExp(`from:xtestuser since:${PROBE_JOIN_DEFAULT}`).test(q), q);
 }
 
 {
@@ -187,13 +201,25 @@ console.log('\nProbe result handling');
 
 {
   // The whole point: a rare poster with years between posts still succeeds.
-  const { w, tok, probeUrl, scanId } = await startProbe();
+  //
+  // This used to be driven by a probe. It no longer is: an account whose posts
+  // span years is older than PROBE_TRUST_DAYS, so the probe is never opened for
+  // it and the scan begins in the windowed path. The scenario is still worth
+  // protecting - a rare poster must not become unfindable - so it is asserted
+  // against the path that now handles it.
+  const { w, tok, probeUrl, scanId } = await startProbe({}, '2023-01-01');
+  const first = decodeURIComponent(w.log.navigated[0].url);
+  check('a rare poster spanning years never opens a probe', !/xs_probe=1/.test(first),
+    first.slice(0, 110));
   w.setTabUrl(1, probeUrl);
-  const r = await w.send(
-    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
+  // The first window is searched and comes back empty, then the scan widens -
+  // the same shape as any long-lived account.
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: null },
     scanSender(probeUrl, scanId));
-  check('a 4-post account spanning 2 years succeeds where 7-day windows failed',
-    r?.ok === true, JSON.stringify(r));
+  await new Promise(r => setTimeout(r, 1200));
+  const running = Object.values(w.store.session)[0] !== undefined;
+  check('a rare poster spanning years is still being searched', running,
+    'the scan gave up on a rare poster');
 }
 
 console.log('\nProbe result validation');
@@ -306,16 +332,14 @@ console.log('\nProbe trust');
   // first. Age-weighting that page still lands near today when the back
   // catalogue was never on it, so a long-lived account must skip the probe and
   // use the windowed scan instead.
-  const { w, tok, probeUrl, scanId } = await startProbe();
-  w.setTabUrl(1, probeUrl);
-  await w.send(
-    { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
-    scanSender(probeUrl, scanId));
-  // The windowed scan navigates the user's tab, so 'does not navigate' has
-  // to mean 'does not land a result yet' - the probe is not trusted as the
-  // whole history, so no post is chosen from it.
+  // A long-lived account no longer opens a probe, so this is asserted on the
+  // first navigation rather than on a probe result that can no longer arrive.
+  const { w, tok, probeUrl, scanId } = await startProbe({}, '2023-01-01');
+  const first = decodeURIComponent(w.log.navigated[0].url);
   check('a long-lived account does not land a post straight from the probe',
-    !userNavs(w).some(u => u.includes('xs_post=')), JSON.stringify(userNavs(w)));
+    !/xs_probe=1/.test(first) && !userNavs(w).some(u => u.includes('xs_post=')),
+    `${first.slice(0, 90)} ${JSON.stringify(userNavs(w))}`);
+  w.setTabUrl(1, probeUrl);
   // The fall-through to a windowed search is itself a retry, so it waits out
   // the retry delay before navigating. Without this the assertion below reads
   // the probe's own whole-history range and calls it unbounded.

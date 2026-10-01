@@ -621,6 +621,35 @@
     return false;
   }
 
+  /**
+   * Whether the whole-history probe is worth opening at all.
+   *
+   * The probe's result is discarded whenever one page of results cannot
+   * plausibly span the account - specifically when the account is older than
+   * PROBE_TRUST_DAYS. That depends only on the join date, which the scan
+   * already has before it opens anything, so a probe that is guaranteed to be
+   * thrown away can be skipped instead of run.
+   *
+   * This matters because the probe is the FIRST navigation out of the profile,
+   * and the scan runs in the user's own tab: for any account older than four
+   * months, every single shuffle opened a search page, waited for it to render,
+   * discarded the answer and moved on. The user watched a page load and get
+   * skipped every time, which read as a bug in the extension.
+   *
+   * Only the age test is used. A high post count also makes the probe unlikely
+   * to be trusted, but the profile count includes replies and media that X will
+   * not search, so it cannot decide this - guessing here would skip a probe
+   * that would have succeeded.
+   */
+  function probeWorthOpening(joinDate) {
+    const join = new Date(`${joinDate}T00:00:00Z`);
+    if (!Number.isFinite(join.getTime())) return true;
+    const now = new Date();
+    const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const spanDays = Math.max(1, Math.ceil((todayUtc - join) / 86400000));
+    return spanDays <= PROBE_TRUST_DAYS;
+  }
+
   function startDiscovery(message, sender, sendResponse) {
     // Refuse early rather than opening searches X will throttle. The count
     // lives in async storage, so gate the rest of the work behind it.
@@ -675,7 +704,11 @@
       const start = new Date(`${options.rangeStart}T00:00:00Z`);
       const end = new Date(`${options.rangeEnd}T00:00:00Z`);
       if (Number.isFinite(start.getTime()) && Number.isFinite(end.getTime()) && start < end) {
-        const span = Math.ceil((end - start) / 86400000);
+        // A range end is INCLUSIVE to the user: 1st to 31st is 31 days, not 30.
+        // Windows tile the span as [start, start + windowDays), so without the
+        // +1 the final day of a hand-picked range is never searched - and it is
+        // also the one day X serves as until: rather than after the span.
+        const span = Math.ceil((end - start) / 86400000) + 1;
         windowDays = Math.min(MAX_WINDOW_DAYS, Math.max(MIN_WINDOW_DAYS, span));
       }
     }
@@ -694,23 +727,34 @@
     progress(state, 'picking');
 
     // Open the probe first: one search across the account's whole history,
-    // which returns the days that actually contain posts. Falling back to the
-    // windowed scan only happens if that returns nothing. It runs in the
-    // user's tab, so they watch the search rather than being teleported to a
-    // result at the end.
-    persistState(state, () => {
-      if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-      // Counted here rather than only inside navigateScanDelayed, because the
-      // opening probe goes through the immediate path: without this the counter
-      // would still read 0 on the first retry and NO delay would ever apply,
-      // which is exactly the bug this option exists to prevent.
-      state.searchesStarted = (state.searchesStarted || 0) + 1;
-      navigateScan(state, buildProbeUrl(state, token), () => {
-        finish(token, null, 'Could not open an X search.');
-      });
-      chrome.alarms.create(timeoutAlarm(token), { when: Date.now() + SCAN_TIMEOUT_MS });
-      progress(state, 'probing');
-    });
+        // which returns the days that actually contain posts. Falling back to the
+        // windowed scan only happens if that returns nothing, or if the account is
+        // too old for a single page to span it - in which case the probe is not
+        // opened at all, since its answer would be discarded. It runs in the user's
+        // tab, so they watch the search rather than being teleported to a result at
+        // the end.
+        persistState(state, () => {
+          if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
+          chrome.alarms.create(timeoutAlarm(token), { when: Date.now() + SCAN_TIMEOUT_MS });
+
+          // Too old for the probe to be trustworthy: go straight to a date window
+          // so the first thing the user sees is a search that can actually produce
+          // the answer, rather than one whose result is thrown away.
+          if (!probeWorthOpening(joinDate)) {
+            scanNextWindow(token);
+            return;
+          }
+
+          // Counted here rather than only inside navigateScanDelayed, because the
+          // opening probe goes through the immediate path: without this the counter
+          // would still read 0 on the first retry and NO delay would ever apply,
+          // which is exactly the bug this option exists to prevent.
+          state.searchesStarted = (state.searchesStarted || 0) + 1;
+          navigateScan(state, buildProbeUrl(state, token), () => {
+            finish(token, null, 'Could not open an X search.');
+          });
+          progress(state, 'probing');
+        });
   }
 
   function sanitiseOptions(raw) {
@@ -724,8 +768,9 @@
       : null;
     if (windowDays === null && /^\d{4}-\d{2}-\d{2}$/.test(options.rangeStart || '') &&
         /^\d{4}-\d{2}-\d{2}$/.test(options.rangeEnd || '')) {
+      // Inclusive end, so the width is the difference plus one - see above.
       const span = Math.ceil(
-        (new Date(`${options.rangeEnd}T00:00:00Z`) - new Date(`${options.rangeStart}T00:00:00Z`)) / 86400000);
+        (new Date(`${options.rangeEnd}T00:00:00Z`) - new Date(`${options.rangeStart}T00:00:00Z`)) / 86400000) + 1;
       if (Number.isFinite(span) && span >= MIN_WINDOW_DAYS) {
         windowDays = Math.min(MAX_WINDOW_DAYS, span);
       }
