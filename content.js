@@ -83,19 +83,136 @@
     return null;
   }
 
+  // ---- Profile cache -------------------------------------------------------
+  //
+  // A search page cannot tell us when an account joined or how many posts it
+  // has - both live on the profile. The window solver needs both: without a
+  // post count it falls back to the widest possible window, which is the
+  // worst case for rate limits, and without a join date the search has no
+  // floor and no way to validate a result. The old design smuggled the join
+  // date through the URL (xs_join), which only ever worked for searches this
+  // extension built itself.
+  //
+  // So the profile page records what it scraped and the search page reads it
+  // back. That makes the button work on a from: search the user typed by
+  // hand, which is the point of caching rather than passing it along.
+  //
+  // Two things keep the cache honest. A post count is lifetime, so it only
+  // grows and a cached value is always a slight under-estimate; when a scan
+  // comes back empty the entry is dropped, because a too-narrow window is
+  // exactly what produces empty scans. Entries are keyed per account, so
+  // shuffling one person's history then another's never mixes the two - each
+  // subject keeps its own join date and post count.
+  const PROFILE_CACHE_MAX = 200;
+
+  // getSearchContext() is synchronous - refresh() and scanDiscoveryResults()
+  // both need the answer inline - but a storage read is not. So the cache is
+  // mirrored into this snapshot, refreshed on load and after every write. A
+  // miss means "not read yet", which costs a missing button on the first
+  // search after a page load and nothing worse; the MutationObserver-driven
+  // refresh retries once the snapshot lands.
+  let cacheSnapshot = null;
+
+  function loadProfileCache() {
+    readProfileCache(cache => { cacheSnapshot = cache; });
+  }
+
+  function readProfileCache(callback) {
+    chrome.storage.local.get({ profileCache: {} }, data => {
+      const cache = data.profileCache;
+      callback(cache && typeof cache === 'object' && !Array.isArray(cache) ? cache : {});
+    });
+  }
+
+  function writeProfileCache(cache) {
+    // Bound the store: a long-lived install visiting many profiles would
+    // otherwise grow this without limit. Least-recently-seen entries go
+    // first, and a fresh profile always wins over an evicted one.
+    const entries = Object.entries(cache)
+      .sort((a, b) => (b[1]?.seen || 0) - (a[1]?.seen || 0))
+      .slice(0, PROFILE_CACHE_MAX);
+    chrome.storage.local.set({ profileCache: Object.fromEntries(entries) });
+  }
+
+  function cacheProfile(username, joinDate, postCount) {
+    if (!username || !joinDate) return;
+    readProfileCache(cache => {
+      // Keyed by the subject's own handle, so a cache entry can only ever be
+      // read back for that same account. Switching which profile you shuffle
+      // reads a different key; nothing carries over between subjects.
+      // joinDate is normalised to the YYYY-MM-DD string the reader validates:
+      // callers hold a Date, and storing one would serialise to a full
+      // timestamp that then fails the reader's own format check.
+      const day = typeof joinDate === 'string' ? joinDate : formatDate(joinDate);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+      cache[username.toLowerCase()] = { joinDate: day, postCount: postCount ?? null, seen: Date.now() };
+      writeProfileCache(cache);
+      scheduleRefresh();
+    });
+  }
+
+  // Synchronous by design - the caller is getSearchContext(), which runs
+  // inline inside refresh() and scanDiscoveryResults(). The snapshot is
+  // refreshed on load and after every write, so a miss means "not read yet".
+  function lookupProfile(username) {
+    if (!username || !cacheSnapshot) return null;
+    const entry = cacheSnapshot[String(username).toLowerCase()];
+    if (!entry || typeof entry.joinDate !== 'string') return null;
+    return { joinDate: entry.joinDate, postCount: Number.isFinite(entry.postCount) ? entry.postCount : null };
+  }
+
+  // A scan that found nothing may have been squeezed into too narrow a window
+  // by a stale post count. Dropping the entry makes the next attempt size
+  // from scratch instead of repeating the same too-narrow guess.
+  function invalidateProfile(username) {
+    if (!username) return;
+    readProfileCache(cache => {
+      if (!cache[String(username).toLowerCase()]) return;
+      delete cache[String(username).toLowerCase()];
+      writeProfileCache(cache);
+      scheduleRefresh();
+    });
+  }
+
+  // Explicit forget, for signing out or switching account by hand. The account
+  // check on write already prevents cross-account reads, but a user who has
+  // logged out should not find the previous account's stats still on disk.
+  function clearProfileCache() {
+    chrome.storage.local.remove('profileCache');
+  }
+
   function getSearchContext() {
     if (location.pathname !== '/search') return null;
     const params = new URLSearchParams(location.search);
-    const join = params.get('xs_join');
     const username = params.get('q')?.match(/(?:^|\s)from:([A-Za-z0-9_]{1,15})(?=\s|$)/i)?.[1];
-    if (!username || !/^\d{4}-\d{2}-\d{2}$/.test(join || '')) return null;
-    const joinDate = new Date(`${join}T00:00:00Z`);
-    if (!Number.isFinite(joinDate.getTime()) || formatDate(joinDate) !== join || joinDate > new Date()) return null;
+    if (!username) return null;
+
+    // The join date may arrive in the URL (a search this extension built) or
+    // come from the profile cache (a search the user typed). The URL wins when
+    // both are present because it is the value the current scan was sized
+    // against; the cache is what makes hand-typed searches work at all.
+    const join = params.get('xs_join');
+    let joinDate = null;
+    let postCount = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(join || '')) {
+      const parsed = new Date(`${join}T00:00:00Z`);
+      if (Number.isFinite(parsed.getTime()) && formatDate(parsed) === join && parsed <= new Date()) {
+        joinDate = parsed;
+      }
+    }
+    if (!joinDate) {
+      const found = lookupProfile(username);
+      if (!found) return null;
+      const parsed = new Date(`${found.joinDate}T00:00:00Z`);
+      if (!Number.isFinite(parsed.getTime()) || formatDate(parsed) !== found.joinDate || parsed > new Date()) return null;
+      joinDate = parsed;
+      postCount = found.postCount;
+    }
     const postId = params.get('xs_post');
     // The probe is one wide search over the whole history, used to learn
     // which days actually contain posts instead of guessing at a window.
     const probe = params.get('xs_probe') === '1';
-    return { username, joinDate, postId: /^\d+$/.test(postId || '') ? postId : null, probe };
+    return { username, joinDate, postId: /^\d+$/.test(postId || '') ? postId : null, probe, postCount: postCount ?? null };
   }
 
   function removeShuffleUI() {
@@ -186,7 +303,10 @@
         requestId,
         username,
         joinDate: formatDate(date),
-        postCount: getPostCount(),
+        // A search page has no profile header to read a post count from, so it
+        // comes from the cache when one is available. Null here is not fatal:
+        // the worker falls back to its widest safe window.
+        postCount: getPostCount() ?? lookupProfile(username)?.postCount ?? null,
         options: loadOptions()
       }, response => {
         if (button.dataset.requestId !== requestId) return;
@@ -246,6 +366,11 @@
       console.warn(`[Xshuffle] Could not find a visible join date for @${username}; Shuffle is disabled.`);
       warnedFor = username;
     }
+    // A profile visit is the only place these two numbers can be read, so this
+    // is where they get recorded. Doing it here rather than on click means a
+    // later hand-typed from: search for this account can be served from the
+    // cache, which is the whole reason the cache exists.
+    if (joinDate) cacheProfile(username, joinDate, getPostCount());
     injectShuffleUI(username, joinDate, header);
   }
 
@@ -382,6 +507,11 @@
       const matches = [...posts.values()];
       reportDiscovery(matches[Math.floor(Math.random() * matches.length)]);
     } else if (/\bNo results for\b/i.test(primary.innerText || '')) {
+      // An empty window can mean the cached post count is stale, which sized
+      // the window too narrow. Dropping the entry makes the next shuffle for
+      // this account size from its widest safe default rather than repeat the
+      // same too-narrow guess. Best effort: a miss here costs nothing.
+      invalidateProfile(context.username);
       reportDiscovery(null);
     }
   }
@@ -438,5 +568,6 @@
   window.addEventListener('popstate', scheduleRefresh);
   new MutationObserver(scheduleRefresh).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   if (discoveryToken) discoveryTimeout = setTimeout(() => reportDiscovery(null), 35000);
+  loadProfileCache();
   loadSettings();
 })();

@@ -7,6 +7,11 @@ catalogue, so you land in 2011 rather than this morning.
 The matching post is scrolled into view, and the button stays available so you
 can shuffle again.
 
+The button also appears on `from:` search results, so you can shuffle straight
+from a search you typed yourself. That needs a record of the account's join
+date and post count, which only the profile page shows — so visit a profile
+once and its search results become shuffleable from then on.
+
 ## Install
 
 1. Download `xshuffle-<version>-src.zip` from the Releases page and extract it.
@@ -71,6 +76,12 @@ Stored locally only:
 
 - your show/hide and option preferences
 - a pause expiry and its reason, set only when X rate-limits the account
+- the join date and post count of profiles you have visited, keyed by
+  username, so a `from:` search you typed yourself can be shuffled. Entries
+  are per-account — shuffling a second person's history reads their entry,
+  never the first one's — and an entry is dropped as soon as a search for
+  that account comes back empty, which is the signature of a stale post
+  count. Capped at the 200 most recent.
 
 There is no account, no donation prompt, and no tracking of any kind.
 

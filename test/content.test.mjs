@@ -32,24 +32,62 @@ function profilePage(headerText, { href = '/frank' } = {}) {
   </body></html>`;
 }
 
-/** Build a search results page. `posts` = [{user,id,iso}] */
-function searchPage(posts, { noResults = false, inner = '' } = {}) {
+/**
+ * Build a search results page. `posts` = [{user,id,iso}]
+ *
+ * `toolbar` adds the search form and its adjacent button that X renders on a
+ * real /search page. The Shuffle button on a search page is injected next to
+ * that button, and the slot is found by comparing bounding boxes - so the
+ * mock has to give those elements real geometry, which jsdom reports as all
+ * zeroes. Without that, getSearchToolbarSlot() correctly finds no slot and the
+ * button is (rightly) not injected.
+ */
+function searchPage(posts, { noResults = false, inner = '', toolbar = false } = {}) {
   const cards = posts.map(p => `
     <article data-testid="tweet">
       <a href="/${p.user}/status/${p.id}"><time datetime="${p.iso}">${p.iso.slice(0, 10)}</time></a>
     </article>`).join('');
   const body = noResults ? '<div>No results for "from:frank"</div>' : cards;
+  const chrome = toolbar ? `
+    <div data-testid="xshuffle-fixture-toolbar">
+      <form role="search"><input name="q" /></form>
+      <button type="button">Search</button>
+    </div>` : '';
   return `<!doctype html><html><body>
-    <div data-testid="primaryColumn">${body}${inner}</div>
+    <div data-testid="primaryColumn">${chrome}${body}${inner}</div>
   </body></html>`;
+}
+
+/**
+ * Give the toolbar elements a geometry jsdom can report, so
+ * getSearchToolbarSlot() can locate the button to sit beside. jsdom has no
+ * layout engine, so getBoundingClientRect() is stubbed per element: the form
+ * occupies the left half and the button the right, on the same line.
+ */
+function withToolbarGeometry(dom) {
+  const rect = (left, right) => ({
+    left, right, top: 0, bottom: 40, width: right - left, height: 40,
+    x: left, y: 0, toJSON() { return this; }
+  });
+  const form = dom.window.document.querySelector('[role="search"]');
+  const button = dom.window.document.querySelector('[data-testid="xshuffle-fixture-toolbar"] button');
+  if (form) form.getBoundingClientRect = () => rect(0, 200);
+  if (button) button.getBoundingClientRect = () => rect(210, 280);
+  return dom;
 }
 
 /**
  * Run content.js inside jsdom. Returns the messages the script sent back to
  * the background worker. Deferred work (queueMicrotask / setTimeout) is
  * flushed before returning, so callers get a settled view.
+ *
+ * `seedStorage` pre-populates chrome.storage.local, which is how a test sets
+ * up a warm profile cache. The mock honours the defaults object the way the
+ * real storage API does - returning the default for any key not yet written -
+ * because the profile cache relies on that to tell "no entry" from "absent
+ * key", and a mock that returned {} regardless would hide the difference.
  */
-async function run(html, url) {
+async function run(html, url, { seedStorage = {} } = {}) {
   const dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true });
   // jsdom does not implement innerText; approximate it with textContent,
   // which is what the real code falls back to anyway.
@@ -60,6 +98,10 @@ async function run(html, url) {
     configurable: true,
   });
   const sent = [];
+  // A real store, not a stub: the profile cache writes and reads through this,
+  // so a mock that discarded writes could not tell a cache that populated
+  // from one that silently did nothing.
+  const localStore = { showShuffleUI: true, ...seedStorage };
   dom.window.chrome = {
     runtime: {
       lastError: undefined,
@@ -67,16 +109,35 @@ async function run(html, url) {
       sendMessage: (msg, cb) => { sent.push(msg); cb && cb({ ok: true }); },
     },
     storage: {
-      local: { get: (d, cb) => cb({ showShuffleUI: true }), set() {} },
+      local: {
+        get: (defaults, cb) => {
+          const result = {};
+          if (typeof defaults === 'string') {
+            result[defaults] = localStore[defaults];
+          } else {
+            for (const key of Object.keys(defaults)) {
+              result[key] = key in localStore ? localStore[key] : defaults[key];
+            }
+          }
+          cb(result);
+        },
+        set: values => { Object.assign(localStore, values); },
+        remove: key => {
+          for (const k of (Array.isArray(key) ? key : [key])) delete localStore[k];
+        }
+      },
       onChanged: { addListener() {} },
     },
   };
   dom.window.eval(SRC);
+  // jsdom has no layout engine, so the toolbar stub geometry has to be in place
+  // before content.js runs - refresh() reads it on its very first pass.
+  withToolbarGeometry(dom);
   // Let the script's microtask (scheduleRefresh) and the discovery scan run.
   await new Promise(r => setTimeout(r, 20));
   lastDom = dom;
   currentMessages = sent;
-  return { dom, sent };
+  return { dom, sent, store: localStore };
 }
 /** Most recent page + its outbound messages, used by clickShuffle below. */
 let lastDom = null;
@@ -300,6 +361,111 @@ function rateLimitPage({ heading = 'Something went wrong', button = 'Reload' } =
   const r = sent.find(m => m.type === 'xshuffle:scan-result');
   check('a page with real posts is not treated as throttled',
     r?.post?.id === '2001', JSON.stringify(r));
+}
+
+// ---------------------------------------------------------- profile cache
+//
+// A search page cannot know when an account joined or how many posts it has -
+// both live on the profile. The cache is what lets a from: search the user
+// typed by hand work at all, so these tests pin the two properties it has to
+// have: entries are per-account, and they are dropped when a scan comes back
+// empty because a stale post count is the likely cause.
+
+console.log('\n\x1b[1mProfile cache\x1b[0m');
+
+/** A from: search with no xs_join - i.e. one the user typed themselves. */
+const typedSearchUrl = (user = 'frank') =>
+  `https://x.com/search?q=from%3A${user}+since%3A2023-01-01`;
+
+{
+  // Visiting a profile records what was scraped. This is the only place the
+  // numbers exist, so nothing downstream works without it.
+  const { store } = await run(profilePage('Joined January 2023 · 1.2K Posts'), 'https://x.com/frank');
+  const entry = store.profileCache?.frank;
+  check('a profile visit records the join date', entry?.joinDate === '2023-01-01', JSON.stringify(entry));
+  check('a profile visit records the post count', entry?.postCount === 1200, JSON.stringify(entry));
+}
+
+{
+  // The headline behaviour: a search the user typed has no xs_join, so the
+  // join date has to come from the cache or the button never appears.
+  const { dom } = await run(searchPage([], { toolbar: true }), typedSearchUrl(), {
+    seedStorage: { profileCache: { frank: { joinDate: '2023-01-01', postCount: 1200, seen: 1 } } }
+  });
+  const btn = dom.window.document.querySelector('.xshuffle-controls .xshuffle-button');
+  check('a hand-typed from: search gets the Shuffle button', !!btn);
+  check('the button is not disabled on a warm cache', btn && !btn.disabled);
+}
+
+{
+  // Cold cache: nothing was ever scraped, so there is no join date and the
+  // button must stay away rather than appear broken.
+  const { dom } = await run(searchPage([], { toolbar: true }), typedSearchUrl());
+  check('a hand-typed search with no cached profile gets no button',
+    !dom.window.document.querySelector('.xshuffle-controls .xshuffle-button'));
+}
+
+{
+  // The case that motivated per-account keys: shuffle one person, then
+  // another. The page here is a search for the SECOND subject, so it must
+  // read that subject's entry and never the first one's - which is exactly
+  // what would happen if the cache were stored as a single "last profile"
+  // value instead of per-account.
+  const { dom } = await run(searchPage([], { toolbar: true }), typedSearchUrl('elon'), {
+    seedStorage: {
+      profileCache: {
+        frank: { joinDate: '2023-01-01', postCount: 1200, seen: 2 },
+        elon: { joinDate: '2006-03-01', postCount: 8000, seen: 1 }
+      }
+    }
+  });
+  const btn = dom.window.document.querySelector('.xshuffle-controls .xshuffle-button');
+  check('the second subject gets a button despite the first being cached too', !!btn);
+  await clickShuffle();
+  const d = currentMessages.find(m => m.type === 'xshuffle:discover');
+  check('a second subject uses its own join date, not the first one\'s',
+    d?.joinDate === '2006-03-01', `got ${d?.joinDate}`);
+  check('a second subject uses its own post count, not the first one\'s',
+    d?.postCount === 8000, `got ${d?.postCount}`);
+}
+
+{
+  // A scan that found nothing may have been squeezed too narrow by a stale
+  // post count, so the entry is dropped and the next attempt sizes afresh.
+  const { store } = await run(searchPage([], { noResults: true }), scanUrl(), {
+    seedStorage: { profileCache: { frank: { joinDate: '2023-01-01', postCount: 1200, seen: 1 } } }
+  });
+  check('an empty scan drops the cached profile so it re-sizes next time',
+    !store.profileCache?.frank, JSON.stringify(store.profileCache));
+}
+
+{
+  // A scan that DID find posts proves the cached numbers were good enough, so
+  // the entry must survive - otherwise every successful shuffle would throw
+  // away the cache and the feature would never warm up.
+  const { store } = await run(
+    searchPage([{ user: 'frank', id: '1234', iso: '2023-03-05T10:00:00.000Z' }]), scanUrl(), {
+      seedStorage: { profileCache: { frank: { joinDate: '2023-01-01', postCount: 1200, seen: 1 } } }
+    });
+  check('a successful scan keeps the cached profile',
+    store.profileCache?.frank?.postCount === 1200, JSON.stringify(store.profileCache));
+}
+
+{
+  // The store is bounded, so a long-lived install visiting many profiles does
+  // not grow it without limit. Least-recently-seen entries go first.
+  const many = {};
+  for (let i = 0; i < 260; i++) {
+    many[`user${i}`] = { joinDate: '2023-01-01', postCount: 10, seen: i };
+  }
+  const { store } = await run(profilePage('Joined January 2023'), 'https://x.com/frank', {
+    seedStorage: { profileCache: many }
+  });
+  const size = Object.keys(store.profileCache || {}).length;
+  check('the cache is capped at 200 entries', size === 200, String(size));
+  check('the least recently seen entries are the ones dropped',
+    !store.profileCache.user0 && !!store.profileCache.user259,
+    JSON.stringify([!!store.profileCache.user0, !!store.profileCache.user259]));
 }
 
 // ------------------------------------------------------------------ summary
