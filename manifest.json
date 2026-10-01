@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Xshuffle",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "description": "Shuffle to a random day from an X account's history.",
   "icons": {
     "16": "icons/icon16.png",

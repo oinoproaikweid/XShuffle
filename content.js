@@ -19,7 +19,20 @@
   let pending = false;
   let settingsRevision = 0;
   let warnedFor = '';
-  const discoveryToken = new URLSearchParams(location.search).get('xs_scan');
+  // The scan token for the URL currently on screen.
+  //
+  // This is read per navigation rather than captured once in a `const`, which
+  // was a latent bug: X is a SPA, so navigating the tab does NOT reload the
+  // content script. One instance lived on across every search page, still
+  // holding the token from the first one. The landing page carries xs_join and
+  // xs_post but deliberately no xs_scan - the scan is over - yet the stale
+  // token was still live, so the finished scan got reported AGAIN and the
+  // worker moved the tab a second time over a result the user already had.
+  //
+  // A fresh page load hid this, which is why it only showed up intermittently.
+  function currentDiscoveryToken() {
+    return new URLSearchParams(location.search).get('xs_scan');
+  }
   let discoveryReported = false;
   // True only while the page's current report is a retractable stall. See
   // unstall() - this is what lets a slow page still deliver its results.
@@ -419,7 +432,7 @@
         currentUrl = location.href;
         routeChanged = true;
         warnedFor = '';
-        if (discoveryToken && discoveryQuery !== location.search) {
+        if (currentDiscoveryToken() && discoveryQuery !== location.search) {
           resetDiscovery();
         }
       }
@@ -505,6 +518,9 @@
   // a late result as authoritative: a scan that has already moved on ignores
   // it, so re-reporting is safe rather than a second scan.
   function reportDiscovery(result) {
+    // Read the token fresh: if the SPA has moved to a page with no scan token,
+    // there is nothing to report and the old token must not be reused.
+    const discoveryToken = currentDiscoveryToken();
     if (!discoveryToken || discoveryReported) return;
     discoveryReported = true;
     // A stall is the one report that can be taken back, so record that it was
@@ -534,7 +550,10 @@
   }
 
   function scanDiscoveryResults() {
-    if (!discoveryToken) return;
+    // A page with no xs_scan is not a scan page - it is either the profile the
+    // scan started from or the result page it landed on. Reporting against a
+    // stale token there is what re-triggered a finished scan.
+    if (!currentDiscoveryToken()) return;
     // Late results on a page already reported as stalled: retract the stall so
     // this scan can report the posts that are actually on screen. This has to
     // come BEFORE the discoveryReported check, or a stalled page would return
@@ -672,7 +691,7 @@
   });
   window.addEventListener('popstate', scheduleRefresh);
   new MutationObserver(scheduleRefresh).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-  if (discoveryToken) armDiscoveryTimeout();
+  if (currentDiscoveryToken()) armDiscoveryTimeout();
   loadProfileCache();
   loadSettings();
 })();

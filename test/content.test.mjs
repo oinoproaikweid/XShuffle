@@ -591,11 +591,9 @@ const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
   // The route-change reset must clear the stall flag too.
   //
   // The retry after a stall is a new URL, so scheduleRefresh resets
-  // discoveryReported - but it left discoveryStalled set from the PREVIOUS
-  // page. The next scan then ran unstall() on a stale flag, which re-opened
-  // reporting for a page that had already reported a real result, letting the
-  // same page report twice and the worker navigate again over a result the
-  // user already had.
+  // discoveryReported - but it left discoveryStalled set from the previous
+  // page, so the next scan re-opened reporting on a page that had already
+  // reported a real result.
   //
   // Asserted on the source because the failure needs a route change between a
   // stall and a later report, which jsdom cannot produce on demand.
@@ -603,6 +601,90 @@ const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
   check('the route-change reset clears the stall flag',
     !!routeReset && /discoveryStalled = false/.test(routeReset[0]),
     routeReset ? routeReset[0].replace(/\s+/g, ' ').slice(0, 160) : 'reset block not found');
+}
+
+// --------------------------------- a landed result must end the scan for good
+
+console.log('\n\x1b[1mSPA navigation after a result\x1b[0m');
+
+const TWO_POSTS = '<article data-testid="tweet"><a href="/frank/status/123">' +
+  '<time datetime="2024-05-02T10:00:00Z">May 2</time></a></article>' +
+  '<article data-testid="tweet"><a href="/frank/status/456">' +
+  '<time datetime="2024-06-02T10:00:00Z">Jun 2</time></a></article>';
+
+// The URL the scan actually lands on once it finds a post. buildDailySearchUrl
+// writes xs_join and xs_post and deliberately NOT xs_scan - the scan is over,
+// so there is nothing left to report. scanUrl() hardcodes a token, so this is
+// spelled out rather than derived from it.
+const landingUrl = () =>
+  'https://x.com/search?q=from%3Afrank+since%3A2024-05-02+until%3A2024-05-02' +
+  '&src=typed_query&f=live&xs_join=2023-01-01&xs_post=555';
+
+{
+  // This is the "one skip" that survived every previous fix.
+  //
+  // discoveryToken is a `const` read once when content.js first runs. X is a
+  // SPA, so the worker navigating the tab does NOT reload the content script -
+  // the same instance lives on, still holding the token from the search page.
+  // The landing page has no xs_scan, but nothing notices that: on any later
+  // route change the stale token is still live, the page still has posts in it,
+  // and the script reports AGAIN against a scan that already finished. The
+  // worker treats it as a fresh result for a dead token and moves the tab again.
+  //
+  // A fresh page load is unaffected (proved separately below), which is exactly
+  // why this only showed up intermittently.
+  const dom = new JSDOM(searchPage([{ user: 'frank', id: '1234', iso: '2024-05-02T10:00:00.000Z' }], { toolbar: true }),
+    { url: scanUrl(), runScripts: 'outside-only', pretendToBeVisual: true });
+  Object.defineProperty(dom.window.Element.prototype, 'innerText', {
+    get() { return this.textContent; }, set(v) { this.textContent = v; }, configurable: true });
+  const sent = [];
+  dom.window.chrome = {
+    runtime: {
+      lastError: undefined,
+      onMessage: { addListener() {} },
+      sendMessage: (m, cb) => { sent.push(m); cb && cb({ ok: true }); },
+    },
+    storage: {
+      local: {
+        get: (d, cb) => {
+          const r = {};
+          if (typeof d === 'string') r[d] = undefined;
+          else for (const k of Object.keys(d)) r[k] = d[k];
+          cb(r);
+        },
+        set() {}, remove() {},
+      },
+      onChanged: { addListener() {} },
+    },
+  };
+  withToolbarGeometry(dom);
+  dom.window.eval(SRC);
+  await new Promise(r => setTimeout(r, 40));
+  const onSearch = sent.filter(m => m.type === 'xshuffle:scan-result').length;
+  check('the search page reports once', onSearch === 1, `reports=${onSearch}`);
+
+  // The scan finds a post and the tab is navigated to the landing page. X is a
+  // SPA: pushState, new results rendered, no document reload.
+  dom.window.history.pushState({}, '', landingUrl());
+  dom.window.document.querySelector('[data-testid="primaryColumn"]')
+    .insertAdjacentHTML('beforeend', TWO_POSTS);
+  await new Promise(r => setTimeout(r, 150));
+  const after = sent.filter(m => m.type === 'xshuffle:scan-result');
+  check('the landed result page does NOT report again',
+    after.length === onSearch,
+    `reports=${after.length} (was ${onSearch}): ${JSON.stringify(after.map(m => m.post))}`);
+  check('the landing URL carries no scan token',
+    !/xs_scan=/.test(landingUrl()), landingUrl());
+  dom.window.close();
+}
+{
+  // The control: a genuine fresh load of a landing page must never report,
+  // because it has no token to report with.
+  const { sent } = await run(searchPage([{ user: 'frank', id: '1234', iso: '2024-05-02T10:00:00.000Z' }], { toolbar: true }),
+    landingUrl());
+  check('a fresh load of the landing page reports nothing',
+    sent.filter(m => m.type === 'xshuffle:scan-result').length === 0,
+    `reports=${sent.filter(m => m.type === 'xshuffle:scan-result').length}`);
 }
 
 // ------------------------------------------------------------------ summary
