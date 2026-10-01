@@ -77,6 +77,50 @@ run('monthsBetween guards against a join date after today', () => {
   assert.ok(monthsBetween('2030-01-01', TODAY) >= 1);
 });
 
+// ------------------------------------------------- one-page window ceiling
+//
+// X returns roughly one page of results, newest first. A window wide enough to
+// hold many more posts than that does not widen the sample - it just returns
+// the same newest page every time, so a wide window searches more to learn
+// nothing new and shows the user the same posts. The ceiling below keeps a
+// window to roughly the span one page can actually cover.
+//
+// These fail against the previous build, which allowed any window up to 90
+// days regardless of how many posts that span would contain.
+
+run('a prolific account gets a window that fits on one page', () => {
+  // ~3000 posts over ~44 months is ~68/month, so a page of ~15 posts covers
+  // roughly 7 days. Allowing 90 here returned one page's worth of the newest
+  // posts from the last week, every single time.
+  const days = solveWindowDays(3000, '2023-01-01', TODAY);
+  assert.ok(days <= 15, `expected a page-sized window, got ${days} days`);
+});
+
+run('a very prolific account is not given a multi-week window', () => {
+  // ~7000 posts over 44 months is ~160/month: one page is about 3 days.
+  const days = solveWindowDays(7000, '2023-01-01', TODAY);
+  assert.ok(days <= 7, `expected at most a week, got ${days} days`);
+});
+
+run('a moderate account is still capped to a page-sized window', () => {
+  // ~500/month means a page covers about a day.
+  const days = solveWindowDays(22000, '2023-01-01', TODAY);
+  assert.ok(days <= 3, `expected a couple of days, got ${days} days`);
+});
+
+run('a slow account keeps a wide window - one page spans its whole posting rate', () => {
+  // 72 posts over 44 months is under 2/month, so a page covers years. The cap
+  // must not squeeze this into a narrow window that mostly misses.
+  const days = solveWindowDays(72, '2023-01-01', TODAY);
+  assert.ok(days >= 30, `expected a wide window for a rare poster, got ${days}`);
+});
+
+run('the page ceiling never returns less than a single day', () => {
+  // A hyperactive account would divide to a fraction of a day.
+  const days = solveWindowDays(5000000, '2023-01-01', TODAY);
+  assert.ok(days >= 1, `expected at least one day, got ${days}`);
+});
+
 run('a one-post-per-month account needs a window wider than a week', () => {
   // 1 post/month over 12 months: a 7-day window would miss ~79% of the time.
   const days = solveWindowDays(12, '2025-09-01', TODAY);
