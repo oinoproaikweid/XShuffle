@@ -395,6 +395,20 @@
     injectShuffleUI(username, joinDate, header);
   }
 
+  // Reset discovery for a page the scan has just navigated to.
+  //
+  // Both flags must be cleared together. Clearing only discoveryReported left
+  // discoveryStalled set from the previous page, so the next scan ran unstall()
+  // against a stale flag and re-opened reporting on a page that had already
+  // reported a real result - letting the same page report twice and the worker
+  // navigate again over a result the user already had.
+  function resetDiscovery() {
+    discoveryQuery = location.search;
+    discoveryReported = false;
+    discoveryStalled = false;
+    armDiscoveryTimeout();
+  }
+
   function scheduleRefresh() {
     if (pending) return;
     pending = true;
@@ -406,9 +420,7 @@
         routeChanged = true;
         warnedFor = '';
         if (discoveryToken && discoveryQuery !== location.search) {
-          discoveryQuery = location.search;
-          discoveryReported = false;
-          armDiscoveryTimeout();
+          resetDiscovery();
         }
       }
       if (routeChanged) {

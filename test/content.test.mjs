@@ -587,6 +587,23 @@ const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
     real[0]?.id === '123', JSON.stringify(real[0]));
   dom.window.close();
 }
+{
+  // Route-change reset must clear the stall flag too.
+  //
+  // The retry after a stall is a new URL, so scheduleRefresh resets
+  // discoveryReported - but it left discoveryStalled set from the PREVIOUS
+  // page. The next scan then ran unstall() on a stale flag, which re-opened
+  // reporting for a page that had already reported a real result, letting the
+  // same page report twice and the worker navigate again over a result the
+  // user already had.
+  //
+  // Asserted on the source because the failure needs a route change between a
+  // stall and a later report, which jsdom cannot produce on demand.
+  const routeReset = /discoveryQuery = location\.search;[\s\S]{0,240}?\n\s*\}/.exec(SRC);
+  check('the route-change reset clears the stall flag',
+    !!routeReset && /discoveryStalled = false/.test(routeReset[0]),
+    routeReset ? routeReset[0].replace(/\s+/g, ' ').slice(0, 160) : 'reset block not found');
+}
 
 // ------------------------------------------------------------------ summary
 
