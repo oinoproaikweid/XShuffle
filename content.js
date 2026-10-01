@@ -312,9 +312,20 @@
         if (button.dataset.requestId !== requestId) return;
         clearTimeout(recoveryTimer);
         if (chrome.runtime.lastError || !response?.ok) {
-          button.disabled = false;
-          button.textContent = '🎲 Try again';
-          button.title = response?.message || 'No searchable posts found; try again';
+          if (response?.rateLimited) {
+            // The gate refused before any search ran. Label it as the limit it
+            // is, and disable, so the button does not read as a retryable miss.
+            const mins = Number(response.remaining) || 0;
+            button.textContent = '⏳ Rate-Limited';
+            button.disabled = true;
+            button.title = mins
+              ? `X rate-limited this account. Xshuffle paused for ${mins} minute${mins === 1 ? '' : 's'}.`
+              : response.message || 'X rate-limited this account.';
+          } else {
+            button.disabled = false;
+            button.textContent = '🎲 Try again';
+            button.title = response?.message || 'No searchable posts found; try again';
+          }
           console.warn('[Xshuffle] Could not find a post for this account.', response?.message || chrome.runtime.lastError?.message || '');
         }
       });
@@ -387,8 +398,7 @@
         if (discoveryToken && discoveryQuery !== location.search) {
           discoveryQuery = location.search;
           discoveryReported = false;
-          clearTimeout(discoveryTimeout);
-          discoveryTimeout = setTimeout(() => reportDiscovery(null), 35000);
+          armDiscoveryTimeout();
         }
       }
       if (routeChanged) {
@@ -427,6 +437,14 @@
   const RATE_LIMIT_RE = /something went wrong|rate limit exceeded|you're rate limited|too many requests/i;
   const RATE_LIMIT_RELOAD_RE = /^\s*reload\s*$/i;
 
+  // How long a search page is given to produce results before the attempt is
+  // called a stall. Kept comfortably above a real X search (a couple of
+  // seconds) so ordinary variance is never mistaken for a stall, and well
+  // below the worker's 90s alarm so a stalled window is retried rather than
+  // abandoned. The two are deliberately different numbers answering different
+  // questions: this is per-attempt, the alarm is for the whole scan.
+  const DISCOVERY_TIMEOUT_MS = 35000;
+
   function isRateLimited(primary) {
     if (!primary) return false;
     // Results on the page beat any error text. X can leave a stale panel in
@@ -443,6 +461,18 @@
     return buttons.some(button => RATE_LIMIT_RELOAD_RE.test((button.innerText || '').trim()));
   }
 
+  // A page that never rendered is not an empty window, and reporting it as one
+  // is actively harmful: it burns one of MAX_SCAN_WINDOWS, counts toward the
+  // widening threshold, and widens the window - so the slower X gets, the
+  // shallower the search, and a scan on a slow connection is likeliest to be
+  // the one that gives up. The three stalls needed to trip widening can
+  // therefore be spent on 105 seconds of waiting rather than on three real
+  // misses.
+  //
+  // So a stall is reported distinctly and does not touch emptyWindows. The
+  // worker retries the SAME window rather than a new one: the window was never
+  // disproven, so there is nothing to widen or re-stratify, and retrying it
+  // costs exactly the one attempt a genuinely new window would have cost.
   function reportDiscovery(result) {
     if (!discoveryToken || discoveryReported) return;
     discoveryReported = true;
@@ -451,6 +481,12 @@
       token: discoveryToken,
       post: result
     }, () => void chrome.runtime.lastError);
+  }
+
+  // Shared by the initial arm and every route change, so the two cannot drift.
+  function armDiscoveryTimeout() {
+    clearTimeout(discoveryTimeout);
+    discoveryTimeout = setTimeout(() => reportDiscovery({ stalled: true }), DISCOVERY_TIMEOUT_MS);
   }
 
   function scanDiscoveryResults() {
@@ -542,6 +578,16 @@
       if (message.response?.ok) {
         button.textContent = 'Opening post…';
         button.title = 'Opening the selected post';
+      } else if (message.response?.rateLimited) {
+        // Say what actually happened. "Try again" on a rate limit invites
+        // the user to click straight back into the limit that X just imposed,
+        // which is the one thing that makes it worse.
+        const mins = Number(message.response.remaining) || 0;
+        button.textContent = '⏳ Rate-Limited';
+        button.disabled = true;
+        button.title = mins
+          ? `X rate-limited this account. Xshuffle paused for ${mins} minute${mins === 1 ? '' : 's'} - searching sooner only deepens the limit.`
+          : message.response.message || 'X rate-limited this account.';
       } else {
         button.disabled = false;
         button.textContent = '🎲 Try again';
@@ -567,7 +613,7 @@
   });
   window.addEventListener('popstate', scheduleRefresh);
   new MutationObserver(scheduleRefresh).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-  if (discoveryToken) discoveryTimeout = setTimeout(() => reportDiscovery(null), 35000);
+  if (discoveryToken) armDiscoveryTimeout();
   loadProfileCache();
   loadSettings();
 })();

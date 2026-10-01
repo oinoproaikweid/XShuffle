@@ -164,13 +164,46 @@ renderWindow();
 // implying Xshuffle is throttling the user on its own.
 
 const notice = document.getElementById("rate-limit-notice");
+const ignoreHint = document.getElementById("rate-limit-hint");
 
-chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, ({ cooldownUntil, cooldownReason }) => {
-  const remainingMs = (Number(cooldownUntil) || 0) - Date.now();
+function renderNotice(data) {
+  const remainingMs = (Number(data.cooldownUntil) || 0) - Date.now();
   if (remainingMs <= 0) return;
   const minutes = Math.max(1, Math.ceil(remainingMs / 60000));
   notice.hidden = false;
-  notice.textContent = cooldownReason === 'rate-limited'
+  notice.textContent = data.cooldownReason === 'rate-limited'
     ? `X rate-limited this account. Xshuffle is paused for ${minutes} more minute${minutes === 1 ? '' : 's'} rather than searching again and making it worse.`
     : `A search failed to load, so Xshuffle is paused for ${minutes} more minute${minutes === 1 ? '' : 's'}.`;
+  // The override applies only to a limit X reported, never to the short pause
+  // after a failed load. Say which one is in force rather than letting the
+  // checkbox look universal.
+  ignoreHint.textContent = data.cooldownReason === 'rate-limited'
+    ? 'On: Xshuffle will search straight through this pause. The countdown keeps running, and X may hold the limit for longer.'
+    : 'This override applies only when X rate-limits you. It does not skip the pause that follows a search which failed to load.';
+}
+
+chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, renderNotice);
+
+// Keep the countdown and the override wording live while the popup is open.
+// storage.onChanged fires when the worker sets or clears the pause, so this
+// needs no polling timer of its own.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (!changes.cooldownUntil && !changes.cooldownReason) return;
+  chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, renderNotice);
+});
+
+// ---- Rate-limit override -------------------------------------------------
+
+// The worker reads ignoreRateLimitPause from extension storage on every
+// click, so unlike the search options this needs no copy mirrored into page
+// storage - there is no content-script copy to keep in sync.
+const ignoreRateLimit = document.getElementById("opt-ignore-rate-limit");
+
+ignoreRateLimit.addEventListener("change", () => {
+  chrome.storage.local.set({ ignoreRateLimitPause: ignoreRateLimit.checked === true });
+});
+
+chrome.storage.local.get({ ignoreRateLimitPause: false }, ({ ignoreRateLimitPause }) => {
+  ignoreRateLimit.checked = ignoreRateLimitPause === true;
 });

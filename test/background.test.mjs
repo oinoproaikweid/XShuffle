@@ -477,6 +477,45 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   check('still allows the result on the same account search page', w.log.updated.length > 0);
 }
 {
+  // A STALLED page (content.js gave up at DISCOVERY_TIMEOUT_MS) proves nothing
+  // about whether the window is empty. Treating it as a miss is actively
+  // harmful: it burns a window AND counts toward the widening threshold, so
+  // three stalls in a row would widen the window off pages that never
+  // rendered. The stall is therefore retried on the SAME window and must not
+  // touch emptyWindows.
+  const { w, tok, scanId } = await startScan('nina', '2020-01-01');
+  const before2 = JSON.parse(JSON.stringify(Object.values(w.store.session)[0]));
+  const cur = before2.currentWindow;
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
+  await tick();
+  const state = Object.values(w.store.session)[0];
+  const after = state && JSON.parse(JSON.stringify(state));
+  check('a stall does not count toward widening the window',
+    (after?.emptyWindows ?? 0) === 0,
+    `emptyWindows=${after?.emptyWindows} - a stall must not widen the window`);
+  check('a stall does not widen the window width',
+    after?.windowDays === before2?.windowDays && JSON.stringify(after?.currentWindow) === JSON.stringify(cur),
+    `window ${JSON.stringify(after?.currentWindow)} days=${after?.windowDays} (was ${before2?.windowDays})`);
+  check('a stall still costs one attempt, so a dead connection eventually ends',
+    after?.windowsTried === 2, `windowsTried=${after?.windowsTried}`);
+}
+{
+  // The retry must re-search the SAME window, not draw a new one - the window
+  // was never disproven, so searching a different range would skip over days
+  // that might hold the post.
+  const { w, tok, scanId } = await startScan('oscar', '2020-01-01');
+  const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  const before = w.log.navigated.length;
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } }, scanSender('https://x.com/search?q=x', scanId));
+  await tick();
+  const retried = w.log.navigated.slice(before).map(u => windowOf(decodeURIComponent(u.url))).filter(Boolean).pop();
+  // until: is inclusive, so the URL's last day is the day before the window's
+  // exclusive end - the same conversion every other window assertion uses.
+  const expectedLast = new Date(new Date(cur.end + 'T00:00:00Z').getTime() - 86400000).toISOString().slice(0, 10);
+  check('a stall retries the same window', retried?.[1] === cur.start && retried?.[2] === expectedLast,
+    `retried since=${retried?.[1]} until=${retried?.[2]}, window was ${cur.start}..${cur.end} (searched to ${expectedLast})`);
+}
+{
   // The success path is guarded by stillOurs so a user who navigated away
   // keeps the page they chose. The failure path was not: any miss that ended
   // the scan called returnToProfile unconditionally, yanking a user off
@@ -503,6 +542,28 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
 }
 
 // ------------------------------------------------------------------- timeouts
+
+{
+  // MV3 evicts an idle service worker after ~30s, and a scan that reloads X
+  // repeatedly is exactly the idle case - so this state is reloaded from
+  // session storage far more often than it looks. Anything the widening logic
+  // reads must therefore be in serializableState, or the counter silently
+  // resets mid-scan and the window never widens.
+  const serializable = new Function(
+    `${extractFunction(backgroundSrc, 'serializableState')}\nreturn serializableState;`)();
+  const roundTripped = serializable({
+    token: 't', targetTabId: 1, sourceUrl: 'https://x.com/a', username: 'a',
+    joinDate: '2020-01-01', requestId: 1, windowsTried: 2,
+    triedWindows: new Set([0, 1]), currentWindow: { start: '2020-01-01', end: '2020-01-08' },
+    windowDays: 77, emptyWindows: 2, baseWindowDays: 14, options: {},
+  });
+  check('the widening counter survives a worker restart',
+    roundTripped.emptyWindows === 2, `emptyWindows=${roundTripped.emptyWindows}`);
+  check('the original window width survives a worker restart',
+    roundTripped.baseWindowDays === 14, `baseWindowDays=${roundTripped.baseWindowDays}`);
+  check('the current window width survives a worker restart',
+    roundTripped.windowDays === 77, `windowDays=${roundTripped.windowDays}`);
+}
 
 console.log('\n\x1b[1mTimeout\x1b[0m');
 {

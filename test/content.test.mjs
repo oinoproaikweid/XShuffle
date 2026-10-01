@@ -468,6 +468,51 @@ const typedSearchUrl = (user = 'frank') =>
     JSON.stringify([!!store.profileCache.user0, !!store.profileCache.user259]));
 }
 
+// ------------------------------------------------- rate-limited button state
+
+console.log('\n\x1b[1mRate-limited button state\x1b[0m');
+
+/**
+ * Click Shuffle with the worker stubbed to answer `response`, then read the
+ * button back. The button is the only place a user learns a search was
+ * refused because X throttled them, so its label is the feature.
+ */
+async function clickAndReply(response) {
+  await run(profilePage('Joined January 2023'), 'https://x.com/frank');
+  const dom = lastDom;
+  // Re-stub sendMessage now that the page exists: the click path reads the
+  // response, which run()'s stub always answers {ok:true}.
+  dom.window.chrome.runtime.sendMessage = (msg, cb) => {
+    currentMessages.push(msg);
+    cb && cb(response);
+  };
+  const btn = dom.window.document.querySelector('.xshuffle-controls .xshuffle-button');
+  btn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 20));
+  return btn;
+}
+
+{
+  const btn = await clickAndReply({
+    ok: false, rateLimited: true, remaining: 15,
+    message: 'X rate-limited this account, so Xshuffle paused for 15 minutes.'
+  });
+  check('a refused scan labels the button Rate-Limited',
+    /rate-limited/i.test(btn.textContent), `text="${btn.textContent}"`);
+  check('a rate-limited button is disabled so it cannot be clicked into the limit',
+    btn.disabled === true, `disabled=${btn.disabled}`);
+  check('the rate-limit title names the cause and the wait',
+    /rate-limited/i.test(btn.title) && /15/.test(btn.title), `title="${btn.title}"`);
+}
+{
+  const btn = await clickAndReply({
+    ok: false, message: 'X search found no visible posts for this account.'
+  });
+  check('an ordinary miss still offers Try again',
+    /try again/i.test(btn.textContent) && btn.disabled === false,
+    `text="${btn.textContent}" disabled=${btn.disabled}`);
+}
+
 // ------------------------------------------------------------------ summary
 
 console.log(`\n\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);

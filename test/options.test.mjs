@@ -343,6 +343,63 @@ console.log('\nRate-limit cooldown');
   eq('a scan during a pause is refused', res?.ok, false);
   check('the refusal names X as the cause', /rate-limited/i.test(res?.message || ''), res?.message);
   check('the refusal opens no search tab', w.log.navigated.length === 0);
+  // The button renders from this flag, so it has to be set on the refusal and
+  // not just inside the message text.
+  eq('the refusal is flagged as a rate limit', res?.rateLimited, true);
+  check('the refusal reports how long is left', Number(res?.remaining) > 0, String(res?.remaining));
+}
+
+{
+  // With the override on, the gate lets the scan through. The pause stays on
+  // record - bypassing the gate is not the same as forgetting it - so the
+  // countdown keeps ticking and the popup can still show it.
+  const w = makeWorker();
+  w.store.local.cooldownUntil = new Date('2026-09-28T12:10:00Z').getTime();
+  w.store.local.cooldownReason = 'rate-limited';
+  w.store.local.ignoreRateLimitPause = true;
+  // No await: once the gate passes, the worker starts the scan and only
+  // replies when it finishes, so awaiting would hang on a search that
+  // legitimately never answers this harness.
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  check('the override lets a scan through an X rate limit', w.log.navigated.length === 1,
+    JSON.stringify(w.log.navigated.map(u => u.url)));
+  check('the override does not clear the pause',
+    Number(w.store.local.cooldownUntil) === new Date('2026-09-28T12:10:00Z').getTime(),
+    String(w.store.local.cooldownUntil));
+}
+
+{
+  // The override is scoped to limits X reported. The short safety pause that
+  // follows a scan which failed to load is Xshuffle's own cooldown, and
+  // skipping it just fires the same doomed search again immediately.
+  const w = makeWorker();
+  w.store.local.cooldownUntil = new Date('2026-09-28T12:02:00Z').getTime();
+  w.store.local.cooldownReason = 'scan-failed';
+  w.store.local.ignoreRateLimitPause = true;
+  const res = await w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  eq('the override does not skip the failed-load pause', res?.ok, false);
+  check('the override does not skip the failed-load pause (no search)', w.log.navigated.length === 0,
+    JSON.stringify(w.log.navigated.map(u => u.url)));
+  eq('and that pause is not flagged as a rate limit', res?.rateLimited, false);
+}
+
+{
+  // A truthy non-boolean must not enable the override: storage can hold
+  // anything, and this is the switch that talks to X's limiter.
+  const w = makeWorker();
+  w.store.local.cooldownUntil = new Date('2026-09-28T12:10:00Z').getTime();
+  w.store.local.cooldownReason = 'rate-limited';
+  w.store.local.ignoreRateLimitPause = 'yes';
+  const res = await w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  eq('a non-boolean override value does not bypass the pause', res?.ok, false);
+  check('a non-boolean override value opens no search', w.log.navigated.length === 0);
 }
 
 {

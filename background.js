@@ -78,6 +78,15 @@
       triedWindows: [...state.triedWindows],
       currentWindow: state.currentWindow,
       windowDays: state.windowDays,
+      // The widening counter and the original width have to survive a worker
+      // restart. MV3 evicts an idle service worker after ~30s and a scan that
+      // reloads X repeatedly is exactly the idle case, so this state is read
+      // back far more often than it looks. Without them here the counter
+      // silently resets to 0 mid-scan and the window never widens, which is
+      // how a bursty account ends up exhausting MAX_SCAN_WINDOWS on windows
+      // that were too narrow to begin with.
+      emptyWindows: state.emptyWindows || 0,
+      baseWindowDays: state.baseWindowDays ?? state.windowDays,
       options: state.options
     };
   }
@@ -267,7 +276,7 @@
     return { start: formatDate(start), end: formatDate(end) };
   }
 
-  function scanNextWindow(token) {
+  function scanNextWindow(token, options = {}) {
     const state = pending.get(token);
     if (!state) return;
     if (state.windowsTried >= MAX_SCAN_WINDOWS) {
@@ -292,6 +301,29 @@
           finish(token, null, 'Could not continue searching X.');
         });
         progress(state, 'looking', first);
+      });
+      return;
+    }
+
+    // A stalled page proved nothing about the window, so retry that window
+    // rather than drawing a new one. It has to skip the widening bookkeeping
+    // below, because emptyWindows counts real misses - three stalls would
+    // otherwise widen the window off a page that never rendered.
+    //
+    // The attempt is still charged: a page that never loads costs the same
+    // budget as one that does, so a genuinely broken connection eventually
+    // ends the scan instead of retrying the same window forever. But it is
+    // charged on windowsTried only, and the window stays available because it
+    // was never actually searched.
+    if (options.retrySameWindow && state.currentWindow) {
+      const same = state.currentWindow;
+      state.windowsTried += 1;
+      persistState(state, () => {
+        if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
+        navigateScan(state, buildScanUrl(state, token, same.start, same.end), () => {
+          finish(token, null, 'Could not continue searching X.');
+        });
+        progress(state, 'retrying', same);
       });
       return;
     }
@@ -415,6 +447,13 @@
   // The expiry is stored in local storage rather than memory so a worker
   // restart mid-pause does not silently hand the user a fresh budget.
 
+  // ignoreRateLimitPause lets a user search through an X-imposed pause. It
+  // deliberately does NOT excuse the short safety pause that follows a scan
+  // which failed to load: that one is Xshuffle's own cooldown after a request
+  // went nowhere, not a limit X reported, and ignoring it just fires the same
+  // doomed search again immediately.
+  const IGNORE_KEY = 'ignoreRateLimitPause';
+
   function startCooldown(ms, reason, callback) {
     const now = Date.now();
     chrome.storage.local.set({ cooldownUntil: now + ms, cooldownReason: reason }, () => {
@@ -424,7 +463,9 @@
   }
 
   function cooldownStatus(callback) {
-    chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, data => {
+    chrome.storage.local.get(
+      { cooldownUntil: 0, cooldownReason: '', [IGNORE_KEY]: false },
+      data => {
       const now = Date.now();
       const until = Number(data.cooldownUntil) || 0;
       if (until <= now) {
@@ -435,23 +476,36 @@
       }
       const waitMinutes = Math.max(1, Math.ceil((until - now) / 60000));
       const detected = data.cooldownReason === 'rate-limited';
+      // Overridable only for a limit X actually reported. The pause stays on
+      // record either way, so the countdown keeps ticking and the popup can
+      // still show it - bypassing the gate is not the same as forgetting it.
+      const ignored = detected && data[IGNORE_KEY] === true;
       callback({
         blocked: true,
+        ignored,
         remaining: waitMinutes,
         reason: data.cooldownReason || '',
-        message: detected
+        message: ignored
+          ? `X rate-limited this account ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'} ago. Searching anyway because you asked to ignore the pause.`
+          : detected
           ? `X rate-limited this account, so Xshuffle paused for ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'}. Searching again before then would only deepen the limit.`
           : `Xshuffle paused for ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'} after a search failed to load.`
       });
     });
   }
 
-  function finish(token, post, message) {
+  function finish(token, post, message, detail = {}) {
     const state = pending.get(token);
     if (!state) return;
     pending.delete(token);
     chrome.storage.session.remove(stateKey(token));
     chrome.alarms.clear(timeoutAlarm(token));
+
+    // rateLimited/remaining ride along on the response so the button can say
+    // "Rate-limited" instead of a generic failure. Without them the button
+    // shows "Try again" for a limit that a retry cannot fix, which invites
+    // exactly the repeated clicking that deepens the limit.
+    const failure = { ok: false, message: message || 'X search found no visible posts for this account.', ...detail };
 
     if (!post) {
       // The search ran in the user's tab, so a miss would otherwise leave them
@@ -467,7 +521,7 @@
       // what happened.
       chrome.tabs.get(state.targetTabId, target => {
         if (!chrome.runtime.lastError && stillOurs(state, target?.url)) returnToProfile(state);
-        respond(state, { ok: false, message: message || 'X search found no visible posts for this account.' });
+        respond(state, failure);
       });
       return;
     }
@@ -515,9 +569,19 @@
   function startDiscovery(message, sender, sendResponse) {
     // Refuse early rather than opening searches X will throttle. The count
     // lives in async storage, so gate the rest of the work behind it.
+    //
+    // A pause the user has chosen to ignore is not a refusal - the scan runs,
+    // and the pause stays on record so the countdown keeps ticking. The
+    // refusal is also reported with `rateLimited` set, because that is what
+    // the button needs to render "Rate-limited" rather than a generic failure.
     cooldownStatus(gate => {
-      if (gate.blocked) {
-        sendResponse({ ok: false, message: gate.message });
+      if (gate.blocked && !gate.ignored) {
+        sendResponse({
+          ok: false,
+          message: gate.message,
+          rateLimited: gate.reason === 'rate-limited',
+          remaining: gate.remaining
+        });
         return;
       }
       beginDiscovery(message, sender, sendResponse);
@@ -632,8 +696,17 @@
         // treating the panel as an empty window: every further window is
         // another search against an account that has already said no.
         startCooldown(RATE_LIMIT_COOLDOWN_MS, 'rate-limited', () => {
-          finish(message.token, null, 'X rate-limited this account, so Xshuffle paused itself rather than searching again and making it worse. Try again in about 15 minutes.');
+          finish(message.token, null, 'X rate-limited this account, so Xshuffle paused itself rather than searching again and making it worse. Try again in about 15 minutes.', { rateLimited: true, remaining: Math.round(RATE_LIMIT_COOLDOWN_MS / 60000) });
         });
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.post?.stalled) {
+        // The search page never rendered results in time. That says nothing
+        // about whether the window is empty, so it is retried rather than
+        // counted as a miss - see scanNextWindow.
+        scanNextWindow(message.token, { retrySameWindow: true });
         sendResponse({ ok: true });
         return;
       }
