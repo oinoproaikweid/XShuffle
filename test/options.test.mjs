@@ -30,7 +30,7 @@ function fail(name, detail) {
 
 function makeWorker({ today = '2026-09-28' } = {}) {
   const store = { session: {}, local: {} };
-  const log = { created: [], updated: [], removed: [], messages: [], alarms: [], cleared: [] };
+  const log = { created: [], navigated: [], updated: [], removed: [], messages: [], alarms: [], cleared: [] };
   let nextTabId = 500;
   let messageListener = null;
   const alarmListeners = [];
@@ -71,8 +71,21 @@ function makeWorker({ today = '2026-09-28' } = {}) {
       onAlarm: { addListener: fn => alarmListeners.push(fn) }
     },
     tabs: {
-      create: ({ url, active }, cb) => { const id = nextTabId++; log.created.push({ url, active, id }); cb && cb({ id, url }); },
-      update: (id, { url }, cb) => { log.updated.push({ id, url }); cb && cb({ id, url }); },
+      // `navigated` records every URL the extension sent a tab to, in order,
+      // whether via tabs.create or tabs.update. The scan now runs in the user's
+      // own tab, so a single stream is what the tests actually care about;
+      // created/updated stay for the few assertions that still distinguish them.
+      create: ({ url, active }, cb) => {
+        const id = nextTabId++;
+        log.navigated.push({ url, active, id });
+        log.navigated.push({ id, url });
+        cb && cb({ id, url });
+      },
+      update: (id, { url }, cb) => {
+        log.updated.push({ id, url });
+        log.navigated.push({ id, url });
+        cb && cb({ id, url });
+      },
       remove: (id, cb) => { log.removed.push(id); cb && cb(); },
       get: (id, cb) => cb({ id, url: store.session.__tabUrl || 'https://x.com/bob' }),
       sendMessage: (id, msg, cb) => { log.messages.push({ id, msg }); cb && cb(); }
@@ -113,9 +126,9 @@ console.log('\nSearch filters');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
     postCount: 72, options: { excludeReplies: true }
   }, profileSender('https://x.com/bob'));
-  check('excludeReplies adds filter:replies', /filter:replies/.test(queryOf(w.log.created[0]?.url)),
-    queryOf(w.log.created[0]?.url));
-  check('excludeReplies alone adds no media filter', !/filter:media/.test(queryOf(w.log.created[0]?.url)));
+  check('excludeReplies adds filter:replies', /filter:replies/.test(queryOf(w.log.navigated[0]?.url)),
+    queryOf(w.log.navigated[0]?.url));
+  check('excludeReplies alone adds no media filter', !/filter:media/.test(queryOf(w.log.navigated[0]?.url)));
 }
 
 {
@@ -124,7 +137,7 @@ console.log('\nSearch filters');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
     postCount: 72, options: { mediaOnly: true }
   }, profileSender('https://x.com/bob'));
-  check('mediaOnly adds filter:media', /filter:media/.test(queryOf(w.log.created[0]?.url)));
+  check('mediaOnly adds filter:media', /filter:media/.test(queryOf(w.log.navigated[0]?.url)));
 }
 
 {
@@ -133,7 +146,7 @@ console.log('\nSearch filters');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
     postCount: 72, options: { excludeReplies: true, mediaOnly: true }
   }, profileSender('https://x.com/bob'));
-  const q = queryOf(w.log.created[0]?.url);
+  const q = queryOf(w.log.navigated[0]?.url);
   check('both filters combine', /filter:replies/.test(q) && /filter:media/.test(q), q);
   check('filters sit after the date bounds', q.indexOf('until:') < q.indexOf('filter:'), q);
 }
@@ -145,7 +158,7 @@ console.log('\nSearch filters');
     postCount: 72, options: { excludeReplies: 'yes-please' }
   }, profileSender('https://x.com/bob'));
   check('non-boolean filter values are ignored',
-    !/filter:replies/.test(queryOf(w.log.created[0]?.url)));
+    !/filter:replies/.test(queryOf(w.log.navigated[0]?.url)));
 }
 
 // ------------------------------------------------------------ date range --
@@ -159,7 +172,7 @@ console.log('\nManual date range');
     postCount: 72, options: { rangeStart: '2024-03-01', rangeEnd: '2024-03-31' }
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  const q = queryOf(w.log.created[0]?.url);
+  const q = queryOf(w.log.navigated[0]?.url);
   // A 30-day range is one window, so the bounds are the range itself.
   check('explicit range is honoured', /since:2024-03-01/.test(q) && /until:2024-03-31/.test(q), q);
   check('range overrides the posting-rate estimate', /since:2024-03-01/.test(q));
@@ -175,8 +188,8 @@ console.log('\nManual date range');
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
   check('a malformed range falls back to automatic sizing',
-    !/since:2024-03-01/.test(queryOf(w.log.created[0]?.url)),
-    queryOf(w.log.created[0]?.url));
+    !/since:2024-03-01/.test(queryOf(w.log.navigated[0]?.url)),
+    queryOf(w.log.navigated[0]?.url));
 }
 
 {
@@ -186,7 +199,7 @@ console.log('\nManual date range');
     postCount: 72, options: { rangeStart: '2024-03-31', rangeEnd: '2024-03-01' }
   }, profileSender('https://x.com/bob'));
   eq('an inverted range is refused', res?.ok, false);
-  check('an inverted range opens no search tab', w.log.created.length === 0);
+  check('an inverted range opens no search tab', w.log.navigated.length === 0);
 }
 
 // ---------------------------------------------------------- single post ----
@@ -206,8 +219,8 @@ async function scanToPost(w, options = {}) {
     postCount: 72, options
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  const probeUrl = w.log.created[0]?.url;
-  const scanId = w.log.created[0].id;
+  const probeUrl = w.log.navigated[0]?.url;
+  const scanId = w.log.navigated[0].id;
   // Empty probe -> the worker opens a windowed search in the same tab.
   await w.send({ type: 'xshuffle:scan-result', token: 'tok-1', post: null }, scanSender(probeUrl, scanId));
   await new Promise(r => setImmediate(r));
@@ -259,7 +272,7 @@ console.log('\nRate-limit cooldown');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  eq('an unthrottled scan opens exactly one search tab', w.log.created.length, 1);
+  eq('an unthrottled scan opens exactly one search tab', w.log.navigated.length, 1);
   check('a scan that has not been throttled records no pause',
     !w.store.local.cooldownUntil, JSON.stringify(w.store.local.cooldownUntil));
 }
@@ -274,7 +287,7 @@ console.log('\nRate-limit cooldown');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  eq('a busy but unthrottled account is not paused on a scan count', w.log.created.length, 1);
+  eq('a busy but unthrottled account is not paused on a scan count', w.log.navigated.length, 1);
 }
 
 {
@@ -285,8 +298,8 @@ console.log('\nRate-limit cooldown');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  const scanTabId = w.log.created[0].id;
-  const before = w.log.updated.length;
+  const scanTabId = w.log.navigated[0].id;
+  const before = w.log.navigated.filter(u => u.url.includes('/search?')).length;
 
   const res = await w.send({ type: 'xshuffle:scan-result', token: 'tok-1', post: { rateLimited: true } },
     scanSender('https://x.com/search?q=x', scanTabId));
@@ -297,9 +310,20 @@ console.log('\nRate-limit cooldown');
   eq('the pause is attributed to X, not to a scan count', w.store.local.cooldownReason, 'rate-limited');
 
   // The regression that matters: the old code read the panel as an empty
-  // window and immediately widened and re-searched, up to 30 times.
-  eq('a throttled scan does not go on to the next date window', w.log.updated.length, before);
-  check('the scan tab is cleaned up', w.log.removed.includes(scanTabId), JSON.stringify(w.log.removed));
+  // window and immediately widened and re-searched, up to 30 times. A
+  // detected limit must end the scan instead of advancing it.
+  //
+  // Return-to-profile is itself a navigation, so counting navigations would
+  // flag correct behaviour. What must not happen is another *search* - a new
+  // date window or a fresh probe.
+  const searches = w.log.navigated.filter(u => u.url.includes('/search?')).length;
+  eq('a throttled scan does not go on to the next date window', searches, before);
+  // A pause sends the user back to the profile rather than closing a scan tab,
+  // which is what the same-tab design does with every failed scan.
+  check('a throttled scan returns the user to the profile',
+    w.log.navigated.some(u => u.url === 'https://x.com/bob'),
+    JSON.stringify(w.log.navigated.map(u => u.url)));
+  check('a throttled scan closes no tab', w.log.removed.length === 0, JSON.stringify(w.log.removed));
 }
 
 {
@@ -311,7 +335,7 @@ console.log('\nRate-limit cooldown');
   }, profileSender('https://x.com/bob'));
   eq('a scan during a pause is refused', res?.ok, false);
   check('the refusal names X as the cause', /rate-limited/i.test(res?.message || ''), res?.message);
-  check('the refusal opens no search tab', w.log.created.length === 0);
+  check('the refusal opens no search tab', w.log.navigated.length === 0);
 }
 
 {
@@ -323,7 +347,7 @@ console.log('\nRate-limit cooldown');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  eq('an expired pause does not block a new scan', w.log.created.length, 1);
+  eq('an expired pause does not block a new scan', w.log.navigated.length, 1);
   check('the expired pause is cleared', w.store.local.cooldownUntil === undefined,
     String(w.store.local.cooldownUntil));
 }
@@ -369,8 +393,8 @@ console.log('\nSearch window slider');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1,
     postCount: 72, options: { windowDays: null }
   }, profileSender('https://x.com/bob'));
-  check('Auto (null) still opens a probe', !!w.log.created[0]?.url,
-    JSON.stringify(w.log.created[0]?.url));
+  check('Auto (null) still opens a probe', !!w.log.navigated[0]?.url,
+    JSON.stringify(w.log.navigated[0]?.url));
 }
 
 {

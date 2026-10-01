@@ -32,7 +32,7 @@ const TODAY = '2026-09-28';
 
 function makeWorker() {
   const store = { session: {}, local: {} };
-  const log = { created: [], updated: [], removed: [], messages: [] };
+  const log = { created: [], navigated: [], updated: [], removed: [], messages: [] };
   let nextTabId = 500;
   let messageListener = null;
   const tabUrls = {};
@@ -64,9 +64,9 @@ function makeWorker() {
     tabs: {
       create: ({ url, active }, cb) => {
         const id = nextTabId++; tabUrls[id] = url;
-        log.created.push({ url, active, id }); cb && cb({ id, url });
+        log.navigated.push({ url, active, id }); cb && cb({ id, url });
       },
-      update: (id, { url }, cb) => { tabUrls[id] = url; log.updated.push({ id, url }); cb && cb({ id, url }); },
+      update: (id, { url }, cb) => { tabUrls[id] = url; log.updated.push({ id, url }); log.navigated.push({ id, url }); cb && cb({ id, url }); },
       remove: (id, cb) => { log.removed.push(id); cb && cb(); },
       get: (id, cb) => cb({ id, url: tabUrls[id] }),
       sendMessage: (id, msg, cb) => { log.messages.push({ id, msg }); cb && cb(); }
@@ -81,7 +81,16 @@ function makeWorker() {
   };
 }
 
-const tick = () => new Promise(r => setImmediate(r));
+const tick = () => new Promise(res => setImmediate(res));
+
+/**
+ * Every navigation the worker sent to the USER'S tab, oldest first. Tab 1 now
+ * receives the probe and every date window as well as the final result, where
+ * it used to receive only the last one, so a test that cares where the user
+ * ended up must read the final entry rather than assume there is only one.
+ */
+const userNavs = w => w.log.updated.filter(u => u.id === 1).map(u => u.url);
+const lastUserNav = w => userNavs(w).slice(-1)[0] || '';
 const profileSender = (url, id = 1) => ({ tab: { id, url } });
 const scanSender = (url, id = 500) => ({ url, tab: { id, url } });
 const queryOf = url => new URL(url).searchParams.get('q');
@@ -92,8 +101,8 @@ async function startProbe(options = {}, joinDate = '2023-01-01') {
     profileSender('https://x.com/xtestuser'));
   await tick();
   const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
-  const probeUrl = w.log.created[0].url;
-  return { w, tok, probeUrl, scanId: w.log.created[0].id };
+  const probeUrl = w.log.navigated[0].url;
+  return { w, tok, probeUrl, scanId: w.log.navigated[0].id };
 }
 
 // The four posts a real whole-history search returned for this account, in the
@@ -149,25 +158,30 @@ console.log('\nProbe result handling');
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
   eq('a probe with posts succeeds immediately', r?.ok, true);
-  const dest = w.log.updated.filter(u => u.id === 1).map(u => u.url);
-  eq('the user tab is navigated once', dest.length, 1);
+  // Tab 1 now receives every navigation, starting with the probe itself, so
+  // the result is the LAST one rather than the only one. The probe is counted
+  // separately to keep the assertion about the destination honest.
+  const all = w.log.updated.filter(u => u.id === 1).map(u => u.url);
+  const dest = all.slice(-1);
+  eq('the user tab is navigated once more to land the post', dest.length, 1);
   const q = dest.length ? new URL(dest[0]).searchParams.get('q') : '';
   check('it navigates to a day that really has a post',
     YOUNG_POSTS.some(p => `since:${p.day}` === /since:\S+/.exec(q)?.[0]), q);
   check('the chosen day comes from the probe, not a guess',
     YOUNG_POSTS.some(p => q.includes(`since:${p.day}`)), q);
-  check('the scan tab is closed', w.log.removed.includes(scanId));
+  // Nothing is closed any more: the scan ran in this tab and it stays open.
+  check('closes no tab', w.log.removed.length === 0, JSON.stringify(w.log.removed));
 }
 
 {
   // The whole point: a rare poster with years between posts still succeeds.
   const { w, tok, probeUrl, scanId } = await startProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
     scanSender(probeUrl, scanId));
@@ -179,7 +193,7 @@ console.log('\nProbe result validation');
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [
       { id: 'not-numeric', day: '2026-07-01' },
@@ -190,14 +204,14 @@ console.log('\nProbe result validation');
     ] } },
     scanSender(probeUrl, scanId));
   eq('a probe with one valid post still succeeds', r?.ok, true);
-  const dest = w.log.updated.filter(u => u.id === 1).map(u => new URL(u.url).searchParams.get('q'));
+  const dest = [new URL(lastUserNav(w)).searchParams.get('q')];
   check('invalid probe entries are discarded', dest.length === 1 && /since:2026-08-05/.test(dest[0]),
     JSON.stringify(dest));
 }
 
 {
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   const r = await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: [] } },
     scanSender(probeUrl, scanId));
@@ -206,17 +220,20 @@ console.log('\nProbe result validation');
   check('an empty probe reports a clear message',
     /no searchable posts/i.test(completion?.msg.response?.message || ''),
     JSON.stringify(completion?.msg.response));
-  check('an empty probe does not navigate the user tab', !w.log.updated.some(u => u.id === 1));
+  // The probe itself does navigate the user's tab now, so what matters is
+  // that it is not navigated to a chosen post - there is none.
+  check('an empty probe lands no post',
+    !userNavs(w).some(u => u.includes('xs_post=')), JSON.stringify(userNavs(w)));
 }
 
 {
   // A manual range must also bound which probe results are acceptable.
   const { w, tok, probeUrl, scanId } = await startYoungProbe({ rangeStart: '2026-07-01', rangeEnd: '2026-08-01' });
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
     scanSender(probeUrl, scanId));
-  const dest = w.log.updated.filter(u => u.id === 1).map(u => new URL(u.url).searchParams.get('q'));
+  const dest = [new URL(lastUserNav(w)).searchParams.get('q')];
   check('posts outside the manual range are discarded',
     dest.every(q => /since:2026-07-04/.test(q)), JSON.stringify(dest));
 }
@@ -229,11 +246,11 @@ console.log('\nProbe distribution');
   const counts = {};
   for (let i = 0; i < 300; i++) {
     const { w, tok, probeUrl, scanId } = await startYoungProbe();
-    w.setTabUrl(1, 'https://x.com/xtestuser');
+    w.setTabUrl(1, probeUrl);
     await w.send(
       { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: YOUNG_POSTS } },
       scanSender(probeUrl, scanId));
-    const dest = w.log.updated.filter(u => u.id === 1);
+    const dest = [{ url: lastUserNav(w) }];
     if (dest.length) {
       const day = (/since:(\S+)/.exec(new URL(dest[0].url).searchParams.get('q')) || [])[1];
       if (day) counts[day] = (counts[day] || 0) + 1;
@@ -257,15 +274,18 @@ console.log('\nProbe trust');
   // catalogue was never on it, so a long-lived account must skip the probe and
   // use the windowed scan instead.
   const { w, tok, probeUrl, scanId } = await startProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: REAL_POSTS } },
     scanSender(probeUrl, scanId));
-  const dest = w.log.updated.filter(u => u.id === 1);
-  eq('a long-lived account does not navigate straight from the probe', dest.length, 0);
+  // The windowed scan navigates the user's tab, so 'does not navigate' has
+  // to mean 'does not land a result yet' - the probe is not trusted as the
+  // whole history, so no post is chosen from it.
+  check('a long-lived account does not land a post straight from the probe',
+    !userNavs(w).some(u => u.includes('xs_post=')), JSON.stringify(userNavs(w)));
   // The windowed scan reuses the scan tab rather than opening a new one, and
   // the user tab must be left alone until a post is actually found.
-  const wq = queryOf(w.log.created[1]?.url || w.log.updated.find(u => u.id === scanId)?.url || '');
+  const wq = queryOf(w.log.navigated[1]?.url || w.log.updated.find(u => u.id === scanId)?.url || '');
   const since = (/since:(\d{4}-\d{2}-\d{2})/.exec(wq) || [])[1];
   const until = (/until:(\d{4}-\d{2}-\d{2})/.exec(wq) || [])[1];
   // The window may legitimately start on the join date, so compare widths:
@@ -284,12 +304,15 @@ console.log('\nProbe trust');
     id: String(700 + i), day: `2026-07-${String(i + 1).padStart(2, '0')}`
   }));
   const { w, tok, probeUrl, scanId } = await startYoungProbe();
-  w.setTabUrl(1, 'https://x.com/xtestuser');
+  w.setTabUrl(1, probeUrl);
   await w.send(
     { type: 'xshuffle:scan-result', token: tok, post: { id: null, day: null, probe: many } },
     scanSender(probeUrl, scanId));
-  const dest = w.log.updated.filter(u => u.id === 1);
-  eq('a full page of results is not trusted as the whole history', dest.length, 0);
+  // Same distinction: the windowed scan runs in the user's tab, so the check
+  // is that a full page of results was not treated as the whole history and a
+  // post landed immediately.
+  check('a full page of results is not trusted as the whole history',
+    !userNavs(w).some(u => u.includes('xs_post=')), JSON.stringify(userNavs(w)));
 }
 
 console.log(`\nprobe search: ${pass} passed, ${failures.length} failed`);

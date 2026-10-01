@@ -28,7 +28,7 @@ function eq(name, actual, expected) {
 /** Build a fresh mock chrome API + sandbox, load background.js, return handles. */
 function makeWorker({ today = '2026-09-28' } = {}) {
   const store = { session: {}, local: {} };
-  const log = { created: [], updated: [], removed: [], messages: [], alarms: [], cleared: [] };
+  const log = { created: [], navigated: [], updated: [], removed: [], messages: [], alarms: [], cleared: [] };
   let nextTabId = 500;
   let messageListener = null;
   const alarmListeners = [];
@@ -72,8 +72,21 @@ function makeWorker({ today = '2026-09-28' } = {}) {
       onAlarm: { addListener: fn => alarmListeners.push(fn) },
     },
     tabs: {
-      create: ({ url, active }, cb) => { const id = nextTabId++; log.created.push({ url, active, id }); cb && cb({ id, url }); },
-      update: (id, { url }, cb) => { log.updated.push({ id, url }); cb && cb({ id, url }); },
+      // `navigated` records every URL the extension sent a tab to, in order,
+      // whether via tabs.create or tabs.update. The scan now runs in the user's
+      // own tab, so a single stream is what the tests actually care about;
+      // created/updated stay for the few assertions that still distinguish them.
+      create: ({ url, active }, cb) => {
+        const id = nextTabId++;
+        log.navigated.push({ url, active, id });
+        log.navigated.push({ id, url });
+        cb && cb({ id, url });
+      },
+      update: (id, { url }, cb) => {
+        log.updated.push({ id, url });
+        log.navigated.push({ id, url });
+        cb && cb({ id, url });
+      },
       remove: (id, cb) => { log.removed.push(id); cb && cb(); },
       get: (id, cb) => cb({ id, url: tabUrls[id] }),
       sendMessage: (id, msg) => log.messages.push({ id, msg }),
@@ -114,7 +127,10 @@ const scanSender = (url, id) => ({ url, tab: { id, url } });
 /** The q= param uses '+' for spaces once URLSearchParams-encoded. */
 const WIN = /since:(\d{4}-\d{2}-\d{2})\+until:(\d{4}-\d{2}-\d{2})/;
 function windowOf(url) { return decodeURIComponent(url).match(WIN); }
-const scanTabIdOf = w => w.log.created[0]?.id;
+// The scan runs in the user's own tab (id 1), so that is the tab a
+// scan-result arrives from. Kept as a helper so the intent is stated once
+// rather than as a bare 1 scattered through the tests.
+const scanTabIdOf = () => 1;
 /**
  * Let queued callbacks and storage mocks run. A scan that starts cleanly does
  * not reply until it finishes, so tests that only care that a tab opened must
@@ -131,9 +147,12 @@ console.log('\n\x1b[1mURL construction\x1b[0m');
     { type: 'xshuffle:discover', username: 'alice', joinDate: '2023-01-15', requestId: 7 },
     profileSender('https://x.com/alice', 1)
   );
-  const url = w.log.created[0]?.url || '';
-  check('opens a scan tab', !!url);
-  check('scan tab is inactive', w.log.created[0]?.active === false);
+  const url = w.log.navigated[0]?.url || '';
+  check('starts a search', !!url);
+  // The scan runs in the tab the user is already on. A second, hidden tab is
+  // exactly what this change removed, so creating one is now a regression.
+  check('opens no extra tab', w.log.created.length === 0, JSON.stringify(w.log.created));
+  check("navigates the user's own tab", w.log.navigated[0]?.id === 1, String(w.log.navigated[0]?.id));
   check('uses x.com/search', url.startsWith('https://x.com/search?'));
   check('has from: filter', decodeURIComponent(url).includes('from:alice'));
   check('has since: bound', decodeURIComponent(url).includes('since:'));
@@ -153,7 +172,7 @@ console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
   const w = makeWorker();
   w.send({ type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72 }, profileSender('https://x.com/bob', 1));
   await tick();
-  const url = decodeURIComponent(w.log.created[0].url);
+  const url = decodeURIComponent(w.log.navigated[0].url);
   const m = windowOf(url);
   check('probe has since/until', !!m);
   check('probe is flagged so the page returns every post', /xs_probe=1/.test(url), url.slice(0, 120));
@@ -163,7 +182,9 @@ console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
     check('probe covers the whole account lifetime',
       Math.round((e - s) / 86400000) > 1000, `${Math.round((e - s) / 86400000)} days`);
   }
-  check('probe searches in the background', w.log.created[0].active === false);
+  // Same here: the probe is a visible search in the user's tab, not a
+  // background one, and it must not create a tab of its own.
+  check('probe opens no extra tab', w.log.created.length === 0, JSON.stringify(w.log.created));
 }
 {
   // With an empty probe, the worker falls back to an adaptively sized window.
@@ -192,7 +213,7 @@ console.log('\n\x1b[1mProbe search and window selection\x1b[0m');
   for (let i = 0; i < 300; i++) {
     const ww = makeWorker();
     await ww.send({ type: 'xshuffle:discover', username: 'c', joinDate: '2020-01-01', requestId: 1 }, profileSender('https://x.com/c', 1));
-    const u = decodeURIComponent(ww.log.created[0].url);
+    const u = decodeURIComponent(ww.log.navigated[0].url);
     const mm = windowOf(u);
     if (mm) picks.push(mm[1]);
   }
@@ -212,7 +233,7 @@ console.log('\n\x1b[1mNo-repeat guarantee\x1b[0m');
   const w = makeWorker();
   await w.send({ type: 'xshuffle:discover', username: 'dave', joinDate: '2020-01-01', requestId: 1 }, profileSender('https://x.com/dave', 1));
   const tok = Object.keys(w.store.session)[0].replace('xshuffle:', '');
-  const seen = new Set([windowOf(w.log.created[0].url)[0]]);
+  const seen = new Set([windowOf(w.log.navigated[0].url)[0]]);
   const scanId = scanTabIdOf(w);
   for (let i = 0; i < 5; i++) {
     w.tabUrls[scanId] = 'https://x.com/search?q=from:dave';
@@ -220,7 +241,9 @@ console.log('\n\x1b[1mNo-repeat guarantee\x1b[0m');
     const g = windowOf(w.log.updated[w.log.updated.length - 1]?.url || '');
     if (g) seen.add(g[0]);
   }
-  const total = w.log.created.length + w.log.updated.length;
+  // navigated already contains every update, so it is the single count -
+  // adding updated as well would count each window twice.
+  const total = w.log.navigated.length;
   check('each retry picks a distinct window', seen.size === total, `unique=${seen.size} issued=${total}`);
 }
 
@@ -236,10 +259,15 @@ console.log('\n\x1b[1mRetry cap\x1b[0m');
     w.tabUrls[scanId] = 'https://x.com/search?q=from:erin';
     await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=from:erin', scanId));
   }
-  const issued = w.log.created.length + w.log.updated.length;
+  const issued = w.log.navigated.length;
   check('stops at 30 windows', issued <= 30, `issued=${issued}`);
   check('reports failure to the page', w.log.messages.some(m => m.msg.type === 'xshuffle:complete' && m.msg.response?.ok === false));
-  check('closes the scan tab', w.log.removed.length > 0);
+  // There is no scan tab to close any more. What must happen instead is the
+  // user being put back on the profile they started from, rather than being
+  // left on the last empty date range.
+  check('closes no tab', w.log.removed.length === 0, JSON.stringify(w.log.removed));
+  check('returns the user to the profile', w.log.navigated.some(u => u.url === 'https://x.com/erin'),
+    JSON.stringify(w.log.navigated.map(u => u.url)));
   check('clears session state', Object.keys(w.store.session).filter(k => k.startsWith('xshuffle:')).length === 0);
 }
 
@@ -256,13 +284,13 @@ const badCases = [
 for (const [label, msg] of badCases) {
   const w = makeWorker();
   const r = await w.send({ type: 'xshuffle:discover', requestId: 1, ...msg }, profileSender('https://x.com/someuser', 1));
-  const rejected = (r?.ok === false) || w.log.created.length === 0;
+  const rejected = (r?.ok === false) || w.log.navigated.length === 0;
   check(`rejects ${label}`, rejected, `response=${JSON.stringify(r)}`);
 }
 {
   const w = makeWorker();
   await w.send({ type: 'xshuffle:discover', username: 'a', joinDate: '2023-01-01', requestId: 1 }, { tab: { id: 1, url: 'https://evil.example/alice' } });
-  check('rejects non-x.com sender', w.log.created.length === 0);
+  check('rejects non-x.com sender', w.log.navigated.length === 0);
 }
 
 // -------------------------------------------------------- post validation
@@ -301,7 +329,9 @@ async function startScan(username = 'frank', joinDate = '2023-01-01', { postCoun
     if (!g) return false;
     return (new Date(g[2] + 'T00:00:00Z') - new Date(g[1] + 'T00:00:00Z')) === 86400000;
   })());
-  check('closes the scan tab on success', w.log.removed.includes(scanId));
+  check('closes no tab on success', w.log.removed.length === 0, JSON.stringify(w.log.removed));
+  check('lands the user on the daily search',
+    w.log.navigated.some(u => decodeURIComponent(u.url).includes('xs_post=1234567890')), '');
 }
 const postBad = [
   ['post date before join', p => ({ id: '1', day: '2019-01-01' })],
@@ -337,10 +367,12 @@ console.log('\n\x1b[1mRedirect guard (user navigated away)\x1b[0m');
   const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '9', day } }, scanSender('https://x.com/search?q=x', scanId));
   const completion = w.log.messages.filter(m => m.msg.type === 'xshuffle:complete').pop();
   check('refuses to hijack a different profile', completion?.msg.response?.ok === false);
-  // The fallback window already updated the scan tab, so assert the user's own
-  // tab (id 1) was left alone rather than counting every tab update.
-  check('does not navigate the user\'s tab', !w.log.updated.some(u => u.id === 1),
-    JSON.stringify(w.log.updated.map(u => u.id)));
+  // The scan windows themselves navigate this tab, so the meaningful check is
+  // that it was NOT taken to the post that was found - the user keeps the page
+  // they chose.
+  check('does not navigate the user to the found post',
+    !w.log.navigated.some(u => decodeURIComponent(u.url).includes('xs_post=9')),
+    JSON.stringify(w.log.navigated.map(u => u.url)));
 }
 {
   const { w, tok, scanId } = await startScan('ivan');
@@ -363,7 +395,9 @@ console.log('\n\x1b[1mTimeout\x1b[0m');
   await new Promise(r => setTimeout(r, 5));
   const completion = w.log.messages.filter(m => m.msg.type === 'xshuffle:complete').pop();
   check('timeout reports failure', completion?.msg.response?.ok === false);
-  check('timeout closes the scan tab', w.log.removed.length > 0);
+  check('timeout closes no tab', w.log.removed.length === 0, JSON.stringify(w.log.removed));
+  check('timeout returns the user to the profile',
+    w.log.navigated.some(u => u.url === 'https://x.com/judy'), JSON.stringify(w.log.navigated.map(u => u.url)));
   check('timeout clears the alarm', w.log.cleared.includes(name));
 }
 

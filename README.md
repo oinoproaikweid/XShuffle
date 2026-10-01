@@ -108,6 +108,12 @@ malformed, the build stops rather than shipping unchecked. Copy
 
 ## Limitations
 
+- The search runs in the tab you are on, so you will see it work — the page
+  moves through date ranges until it finds a post. That is deliberate: it used
+  to happen in a hidden tab, which meant a silent wait and a jump at the end.
+- If a search finds nothing, Xshuffle takes you back to the profile you
+  started from. If you navigate somewhere else while it is searching, it leaves
+  that page alone rather than pulling you back.
 - X limits how many results a single search returns, so Xshuffle cannot
   guarantee a uniform sample of every post. It samples the history.
 - Accounts with very sparse posting can still come up empty.

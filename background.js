@@ -74,7 +74,6 @@
       username: state.username,
       joinDate: state.joinDate,
       requestId: state.requestId,
-      scanTabId: state.scanTabId,
       windowsTried: state.windowsTried,
       triedWindows: [...state.triedWindows],
       currentWindow: state.currentWindow,
@@ -232,12 +231,10 @@
       state.windowsTried = 1;
       persistState(state, () => {
         if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-        chrome.tabs.update(state.scanTabId, {
-          url: buildScanUrl(state, token, first.start, first.end)
-        }, () => {
-          if (chrome.runtime.lastError) finish(token, null, 'Could not continue searching X.');
-          else progress(state, 'looking', first);
+        navigateScan(state, buildScanUrl(state, token, first.start, first.end), () => {
+          finish(token, null, 'Could not continue searching X.');
         });
+        progress(state, 'looking', first);
       });
       return;
     }
@@ -268,13 +265,38 @@
     state.currentWindow = window;
     persistState(state, () => {
       if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-      chrome.tabs.update(state.scanTabId, {
-        url: buildScanUrl(state, token, window.start, window.end)
-      }, () => {
-        if (chrome.runtime.lastError) finish(token, null, 'Could not continue searching X.');
-        else progress(state, 'looking', window);
+      navigateScan(state, buildScanUrl(state, token, window.start, window.end), () => {
+        finish(token, null, 'Could not continue searching X.');
       });
+      progress(state, 'looking', window);
     });
+  }
+
+  // Scan in the tab the user is already looking at.
+  //
+  // This used to open a second, hidden tab and leave the profile untouched
+  // until a post was found. That cost a chrome.tabs.create/remove pair, a
+  // scanTabId threaded through the serialised state, and a guard for the
+  // profile being navigated away mid-scan - all of which exist only because
+  // the search happened somewhere other than the user's tab.
+  //
+  // Searching where the user can see it removes all of that, and the
+  // trade is honest: the searches are visible rather than magic. The
+  // profile is still what we came from, so a failed scan navigates back to
+  // it rather than stranding the user on a junk result page.
+  function navigateScan(state, url, onError) {
+    chrome.tabs.update(state.targetTabId, { url }, () => {
+      if (chrome.runtime.lastError) { onError(); return; }
+    });
+  }
+
+  // Put the user back where they started. Without this a scan that found
+  // nothing would leave them on the last empty date range, which looks like
+  // the extension broke rather than like a miss.
+  function returnToProfile(state) {
+    if (state.sourceUrl?.startsWith('https://x.com/')) {
+      chrome.tabs.update(state.targetTabId, { url: state.sourceUrl }, () => void chrome.runtime.lastError);
+    }
   }
 
   function buildDailySearchUrl(state, post) {
@@ -371,18 +393,24 @@
     pending.delete(token);
     chrome.storage.session.remove(stateKey(token));
     chrome.alarms.clear(timeoutAlarm(token));
-    if (state.scanTabId !== undefined) {
-      chrome.tabs.remove(state.scanTabId, () => void chrome.runtime.lastError);
-    }
 
     if (!post) {
+      // The search ran in the user's tab, so a miss would otherwise leave them
+      // on the last empty date range. Go back to the profile they started from
+      // before reporting, so a failed shuffle ends where a successful one does.
+      returnToProfile(state);
       respond(state, { ok: false, message: message || 'X search found no visible posts for this account.' });
       return;
     }
 
+    // Only take the user somewhere if the tab is still where this scan put it.
+    // Searching in the user's tab means they are free to navigate away
+    // mid-scan, and yanking them off a page they chose would be worse than
+    // not finishing. The old hidden-tab design got this for free because the
+    // profile tab was never touched; now it has to be checked.
     chrome.tabs.get(state.targetTabId, target => {
-      if (chrome.runtime.lastError || tabUsername(target?.url) !== state.username.toLowerCase()) {
-        respond(state, { ok: false, message: 'The profile changed while searching; click Shuffle again.' });
+      if (chrome.runtime.lastError || !stillOurs(state, target?.url)) {
+        respond(state, { ok: false, message: 'You navigated away while Xshuffle was searching, so it left that page alone. Click Shuffle again.' });
         return;
       }
       // Single-post mode lands on the permalink itself, so the user reads one
@@ -399,6 +427,16 @@
         respond(state, { ok: true, singlePost: state.options?.openSinglePost === true });
       });
     });
+  }
+
+  // True when the tab is still showing a search for the account being shuffled.
+  // Anything else - a different profile, an unrelated page, a permalink the
+  // user opened themselves - means the user has taken over and the scan should
+  // report rather than navigate.
+  function stillOurs(state, url) {
+    if (typeof url !== 'string' || !url.startsWith('https://x.com/')) return false;
+    if (!state.currentWindow && !url.includes('/search?')) return false;
+    return tabUsername(url) === String(state.username).toLowerCase();
   }
 
   function startDiscovery(message, sender, sendResponse) {
@@ -456,7 +494,7 @@
     const token = crypto.randomUUID();
     const state = {
       token, targetTabId, sourceUrl, username, joinDate,
-      requestId: message.requestId, sendResponse, scanTabId: undefined,
+      requestId: message.requestId, sendResponse,
       windowsTried: 0, triedWindows: new Set(), currentWindow: null,
       windowDays, options, baseWindowDays: windowDays, emptyWindows: 0
     };
@@ -465,22 +503,16 @@
 
     // Open the probe first: one search across the account's whole history,
     // which returns the days that actually contain posts. Falling back to the
-    // windowed scan only happens if that returns nothing.
-    const probeUrl = buildProbeUrl(state, token);
+    // windowed scan only happens if that returns nothing. It runs in the
+    // user's tab, so they watch the search rather than being teleported to a
+    // result at the end.
     persistState(state, () => {
       if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-      chrome.tabs.create({ url: probeUrl, active: false }, tab => {
-        if (chrome.runtime.lastError || !tab?.id) {
-          finish(token, null, 'Could not open an X search tab.');
-          return;
-        }
-        state.scanTabId = tab.id;
-        persistState(state, () => {
-          if (chrome.runtime.lastError) { finish(token, null, 'Could not save search state.'); return; }
-          chrome.alarms.create(timeoutAlarm(token), { when: Date.now() + SCAN_TIMEOUT_MS });
-          progress(state, 'probing');
-        });
+      navigateScan(state, buildProbeUrl(state, token), () => {
+        finish(token, null, 'Could not open an X search.');
       });
+      chrome.alarms.create(timeoutAlarm(token), { when: Date.now() + SCAN_TIMEOUT_MS });
+      progress(state, 'probing');
     });
   }
 
@@ -518,7 +550,7 @@
     }
     if (message?.type !== 'xshuffle:scan-result' || !sender.tab?.id) return false;
     loadState(message.token, state => {
-      if (!state || state.scanTabId !== sender.tab.id || !sender.url?.startsWith('https://x.com/search?')) {
+      if (!state || state.targetTabId !== sender.tab.id || !sender.url?.startsWith('https://x.com/search?')) {
         sendResponse({ ok: false, message: 'This scan is no longer active.' });
         return;
       }
