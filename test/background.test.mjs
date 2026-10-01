@@ -704,6 +704,80 @@ console.log('\n\x1b[1mSkipping a probe that cannot be trusted\x1b[0m');
     `joinDate=${boundary} first=${first.slice(0, 110)}`);
 }
 
+{
+  // Nothing may move the tab after a result has been landed. The scan has
+  // several things that could still fire: the queued retry delay, the whole-scan
+  // alarm, and the per-page discovery timeout. All three must be quiet, or the
+  // result page drifts somewhere the user did not ask for - which is the
+  // symptom every one of the recent fixes was chasing.
+  //
+  // Asserted over a window comfortably longer than the retry delay AND the
+  // discovery timeout, because those are the two that actually fire on a timer.
+  const { w, tok, scanId } = await startScan('quiescent', '2026-08-01');
+  // startScan reports an empty probe to reach the windowed path, so there is a
+  // real active window to report a post from.
+  const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  // Pick a day genuinely inside [start, end). A young account gets a one-day
+  // window, so start+1 would be the exclusive end - and the post would
+  // correctly be treated as a straggler rather than a result.
+  const width = Math.round((Date.parse(cur.end + 'T00:00:00Z') - Date.parse(cur.start + 'T00:00:00Z')) / 86400000);
+  const day = new Date(Date.parse(cur.start + 'T00:00:00Z') + Math.min(1, Math.max(0, width - 1)) * 86400000)
+    .toISOString().slice(0, 10);
+  check('the chosen post day is inside the active window',
+    day >= cur.start && day < cur.end, `day=${day} window=${cur.start}..${cur.end}`);
+  w.tabUrls[1] = 'https://x.com/quiescent';
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '606', day } },
+    scanSender('https://x.com/search?q=x', scanId));
+  const settled = w.log.navigated.length;
+  const settledUrl = w.log.navigated[settled - 1].url;
+  check('the result landed', /xs_post=606/.test(decodeURIComponent(settledUrl)), settledUrl);
+  // Long enough for a 1s retry delay and a stale timer to have fired.
+  await new Promise(r => setTimeout(r, 2500));
+  check('nothing moves the tab after a result is found',
+    w.log.navigated.length === settled,
+    `${w.log.navigated.length - settled} extra navigation(s): ${JSON.stringify(w.log.navigated.slice(settled).map(u => u.url))}`);
+  check('the scan is fully torn down', Object.values(w.store.session)[0] === undefined,
+    'session state still present');
+  check('the timeout alarm was cleared', w.log.cleared.some(n => n.startsWith('xshuffle-timeout:')),
+    JSON.stringify(w.log.cleared));
+}
+{
+  // The specific case that matters: a delayed retry is QUEUED when the result
+  // arrives, so the scan finishes while a navigation is still pending. Without
+  // the pending-token guard in navigateScanDelayed, that queued navigation
+  // fires afterwards and drags the user off the result they were just given.
+  //
+  // The simple quiescence test above cannot catch this - it reports a result
+  // with no retry in flight - which is why breaking the guard left it green.
+  const w = makeWorker();
+  w.send({ type: 'xshuffle:discover', username: 'racer', joinDate: '2026-08-01', requestId: 1, postCount: 72 },
+    profileSender('https://x.com/racer', 1));
+  await new Promise(r => setImmediate(r));
+  const tok = Object.keys(w.store.session).find(k => k.startsWith('xshuffle:')).replace('xshuffle:', '');
+  // A stall queues a delayed retry of the current window. The result has to
+  // arrive DURING that delay - wait past it and the retry has already fired,
+  // leaving nothing queued and the guard untested.
+  w.send({ type: 'xshuffle:scan-result', token: tok, post: { stalled: true } },
+    scanSender('https://x.com/search?q=x', 1));
+  const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  await new Promise(r => setTimeout(r, 200));   // well inside the 1s delay
+  check('a retry is queued while the scan is still live',
+    Object.values(w.store.session)[0] !== undefined);
+  w.tabUrls[1] = 'https://x.com/racer';
+  const day = cur.start;
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '707', day } },
+    scanSender('https://x.com/search?q=x', 1));
+  const settled = w.log.navigated.length;
+  check('the result landed while a retry was pending',
+    /xs_post=707/.test(decodeURIComponent(w.log.navigated[settled - 1].url)),
+    w.log.navigated[settled - 1].url);
+  // Now wait past the retry delay: the queued navigation must not fire.
+  await new Promise(r => setTimeout(r, 2000));
+  check('a queued retry does not fire after the result landed',
+    w.log.navigated.length === settled,
+    `${w.log.navigated.length - settled} extra navigation(s): ${JSON.stringify(w.log.navigated.slice(settled).map(u => decodeURIComponent(u.url).slice(0, 80)))}`);
+}
+
 // ------------------------------------------------------------------- summary
 
 console.log(`\n\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);
