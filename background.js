@@ -787,6 +787,37 @@
 
       const { id, day } = message.post;
 
+      // A post that is real but does NOT fit the window the scan is currently
+      // searching is a LATE result from a window already left behind - the page
+      // was still rendering when the scan moved on. That happens whenever a slow
+      // page reports after a retry, and it is not an error: the post is genuine,
+      // the account and join date check out, and the only thing wrong is that
+      // the scan is looking elsewhere now.
+      //
+      // Treating it as an unusable date ended the whole scan and returned the
+      // user to the profile, which is exactly the reported symptom: a valid
+      // result on screen, skipped. The scan is still running and can find
+      // something better, so the right response is to ignore the straggler.
+      //
+      // This deliberately runs AFTER the account-level checks below and only
+      // covers the window test. A post dated before the join date or in the
+      // future is not a straggler - it cannot have come from any window of this
+      // account - and must still be rejected outright rather than shrugged off.
+      if (state.currentWindow && /^\d+$/.test(id || '') && /^\d{4}-\d{2}-\d{2}$/.test(day || '')) {
+        const parsed = new Date(`${day}T00:00:00Z`);
+        const join = new Date(`${state.joinDate}T00:00:00Z`);
+        const now = new Date();
+        const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+        const inAccountRange = Number.isFinite(parsed.getTime()) &&
+          formatDate(parsed) === day && parsed >= join && parsed <= todayUtc;
+        const inCurrentWindow = parsed >= new Date(`${state.currentWindow.start}T00:00:00Z`) &&
+          parsed < new Date(`${state.currentWindow.end}T00:00:00Z`);
+        if (inAccountRange && !inCurrentWindow) {
+          sendResponse({ ok: true, stale: true });
+          return;
+        }
+      }
+
       // A probe result carries the account's real post days. Validate every
       // one, then pick among them - this replaces guessing a window width from
       // an estimated posting rate, which the profile post count cannot support

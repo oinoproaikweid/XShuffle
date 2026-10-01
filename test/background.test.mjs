@@ -357,12 +357,29 @@ for (const [label, build] of postBad) {
   check(`rejects ${label}`, rejected, `response=${JSON.stringify(r)}`);
 }
 {
-  // out-of-window post: inside join..today but outside the active window
+  // A post inside join..today but outside the CURRENT window is a straggler
+  // from a window the scan has already left, not bad data - see the late-post
+  // section below. It must be ignored without ending the scan.
+  //
+  // This assertion used to require ok === false, which is the behaviour that
+  // produced the reported symptom: one slow page reporting after the scan moved
+  // on aborted the whole scan and returned the user to the profile.
   const { w, tok, scanId } = await startScan('grace', '2020-01-01');
   const cur = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
   const far = new Date(new Date(cur.end + 'T00:00:00Z').getTime() + 8 * 86400000).toISOString().slice(0, 10);
   const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '42', day: far } }, scanSender('https://x.com/search?q=x', scanId));
-  check('rejects post outside the active window', r?.ok === false, `day=${far} window=${cur.start}..${cur.end}`);
+  check('a post from a superseded window is ignored, not fatal',
+    r?.ok === true && r?.stale === true, `response=${JSON.stringify(r)} day=${far} window=${cur.start}..${cur.end}`);
+  check('and the scan survives it', Object.values(w.store.session)[0] !== undefined);
+}
+{
+  // A date outside the account's own lifetime is NOT a straggler: it cannot
+  // have come from any window of this account, so it stays fatal.
+  const { w, tok, scanId } = await startScan('heidi2', '2020-01-01');
+  const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '42', day: '2031-01-01' } },
+    scanSender('https://x.com/search?q=x', scanId));
+  check('a post from after today is still rejected outright', r?.ok === false,
+    `response=${JSON.stringify(r)}`);
 }
 
 // ------------------------------------------------------- scan window bounds
@@ -591,7 +608,48 @@ console.log('\n\x1b[1mTimeout\x1b[0m');
   check('timeout clears the alarm', w.log.cleared.includes(name));
 }
 
-// ------------------------------------------------------------------ summary
+console.log('\n\x1b[1mA late post from a superseded window\x1b[0m');
+{
+  // A valid post that arrives AFTER the scan moved to a different window must
+  // not abort the scan.
+  //
+  // This is the "skip on a valid result" symptom. The post is real, in range
+  // for the account, and was on screen - but the worker had already moved to
+  // another window, so the post failed the in-window check and was treated as
+  // "an unusable date", which ends the scan and bounces the user back to the
+  // profile. The right response to a late result from a window the scan has
+  // already left is to ignore it and keep looking: the scan is still running
+  // and perfectly able to find something better.
+  const { w, tok, scanId } = await startScan('quinn', '2020-01-01');
+  const before = JSON.parse(JSON.stringify(Object.values(w.store.session)[0])).currentWindow;
+  // A genuinely empty window advances the scan to a different one.
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: null }, scanSender('https://x.com/search?q=x', scanId));
+  await new Promise(r => setTimeout(r, 1200));
+  const now = JSON.parse(JSON.stringify(Object.values(w.store.session)[0]));
+  const cur = now.currentWindow;
+  check('the scan advanced to a new window', JSON.stringify(before) !== JSON.stringify(cur),
+    `window unchanged: ${JSON.stringify(cur)}`);
+  // A post from the window the scan has now LEFT arrives, late. Real post id,
+  // real in-range date - but belonging to the superseded window.
+  const lateDay = new Date(new Date(before.start + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+  const outOfNewWindow = !(cur.start <= lateDay && lateDay < cur.end);
+  check('the late post is outside the new window', outOfNewWindow,
+    `day=${lateDay} new window=${cur.start}..${cur.end}`);
+  await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '424242', day: lateDay } },
+    scanSender('https://x.com/search?q=x', scanId));
+  const stillRunning = Object.values(w.store.session)[0] !== undefined;
+  check('a late post from a superseded window does not end the scan', stillRunning,
+    'scan state was cleared - the scan aborted on a late report');
+  // And the scan must still work: a post genuinely inside the CURRENT window
+  // has to land normally afterwards.
+  const goodDay = new Date(new Date(cur.start + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10);
+  const r = await w.send({ type: 'xshuffle:scan-result', token: tok, post: { id: '515151', day: goodDay } },
+    scanSender('https://x.com/search?q=x', scanId));
+  check('the scan still finds a post in its current window', r?.ok === true,
+    `response=${JSON.stringify(r)}`);
+}
+
+// ------------------------------------------------------------------- summary
 
 console.log(`\n\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);
 if (fail) { console.log('\nfailures:'); failures.forEach(f => console.log('  - ' + f)); process.exit(1); }

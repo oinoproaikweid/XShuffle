@@ -588,7 +588,7 @@ const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
   dom.window.close();
 }
 {
-  // Route-change reset must clear the stall flag too.
+  // The route-change reset must clear the stall flag too.
   //
   // The retry after a stall is a new URL, so scheduleRefresh resets
   // discoveryReported - but it left discoveryStalled set from the PREVIOUS
