@@ -289,6 +289,35 @@
     article.classList.add('xshuffle-found-post');
   }
 
+  // X signals a throttled search with an error panel rather than an empty
+  // result list: a "Something went wrong" heading beside a Reload button,
+  // with no tweets and no "No results for ..." line. Left undetected that
+  // panel is indistinguishable from a genuinely empty date window, so the
+  // scan treats it as a miss, widens the window and searches again - which
+  // is the exact behaviour that provokes the limit in the first place.
+  //
+  // The Reload button is what makes this a positive signal rather than a
+  // guess: a real empty result set says "No results", so requiring the
+  // error panel's own reload affordance keeps the two cases apart.
+  const RATE_LIMIT_RE = /something went wrong|rate limit exceeded|you're rate limited|too many requests/i;
+  const RATE_LIMIT_RELOAD_RE = /^\s*reload\s*$/i;
+
+  function isRateLimited(primary) {
+    if (!primary) return false;
+    // Results on the page beat any error text. X can leave a stale panel in
+    // the DOM while fresh results render, and a post body can contain the
+    // words "something went wrong" in a quote or a tweet. Either way there is
+    // nothing to be throttled about, so posts are checked first and the panel
+    // is only believed when the page is actually empty of them.
+    if (primary.querySelector('[data-testid="tweet"]')) return false;
+    const scope = primary.innerText || '';
+    if (!RATE_LIMIT_RE.test(scope)) return false;
+    // Require the panel's own Reload control so an unrelated "something went
+    // wrong" string elsewhere on the page cannot trip a pause.
+    const buttons = [...primary.querySelectorAll('button, [role="button"]')];
+    return buttons.some(button => RATE_LIMIT_RELOAD_RE.test((button.innerText || '').trim()));
+  }
+
   function reportDiscovery(result) {
     if (!discoveryToken || discoveryReported) return;
     discoveryReported = true;
@@ -304,6 +333,16 @@
     const context = getSearchContext();
     const primary = document.querySelector(SELECTORS.primary);
     if (!context || !primary) return;
+
+    // A throttled search returns an error panel, not results. Report it as a
+    // distinct outcome so the worker pauses instead of counting an empty
+    // window and immediately firing another search at a limit it has already
+    // hit. This has to be checked before the "no results" test below, which
+    // would otherwise misread the panel as an ordinary empty window.
+    if (isRateLimited(primary)) {
+      reportDiscovery({ rateLimited: true });
+      return;
+    }
 
     const today = new Date();
     const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));

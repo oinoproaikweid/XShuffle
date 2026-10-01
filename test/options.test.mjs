@@ -58,7 +58,11 @@ function makeWorker({ today = '2026-09-28' } = {}) {
           }
           cb && cb(r);
         },
-        remove: k => { delete store.local[k]; }
+        remove: k => {
+          // The worker clears a cooldown with an array of keys, so both the
+          // string and array forms have to work here.
+          for (const key of (Array.isArray(k) ? k : [k])) delete store.local[key];
+        }
       }
     },
     alarms: {
@@ -239,6 +243,13 @@ async function scanToPost(w, options = {}) {
 // is found or the scan gives up. Only a refused scan answers immediately.
 // Tests below therefore check tab creation rather than awaiting a reply, and
 // await only where a refusal is expected.
+//
+// The pause is driven by X's own throttle signal, not by a scan budget, so
+// there is deliberately no test here for "the 13th scan is refused". That
+// behaviour is gone; what is tested instead is that a detected limit pauses,
+// that a clean account is never interrupted, and - the case that motivated
+// the change - that a throttled scan stops instead of walking on to the next
+// date window as if the window were merely empty.
 
 console.log('\nRate-limit cooldown');
 
@@ -248,43 +259,91 @@ console.log('\nRate-limit cooldown');
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  eq('an allowed scan opens exactly one search tab', w.log.created.length, 1);
-  check('scan start is recorded',
-    Array.isArray(w.store.local.recentScans) && w.store.local.recentScans.length === 1,
-    JSON.stringify(w.store.local.recentScans));
+  eq('an unthrottled scan opens exactly one search tab', w.log.created.length, 1);
+  check('a scan that has not been throttled records no pause',
+    !w.store.local.cooldownUntil, JSON.stringify(w.store.local.cooldownUntil));
 }
 
 {
   const w = makeWorker();
-  // Pretend the user already burned the whole allowance in this window.
-  // Timestamps must come from the harness's own frozen clock, not Date.now():
-  // the worker sees FakeDate, so real-clock values land in the future and are
-  // discarded as stale, which would silently disable the gate under test.
-  const frozenNow = new Date('2026-09-28T12:00:00Z').getTime();
-  w.store.local.recentScans = Array.from({ length: 12 }, (_, i) => frozenNow - i * 1000);
-  const res = await w.send({
-    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
-  }, profileSender('https://x.com/bob'));
-  eq('scan is refused once the allowance is spent', res?.ok, false);
-  check('refusal explains the pause', /rate-limit|pauses/i.test(res?.message || ''), res?.message);
-  check('refusal opens no search tab', w.log.created.length === 0);
-  check('refusal does not consume more of the allowance',
-    w.store.local.recentScans.length === 12, String(w.store.local.recentScans.length));
-}
-
-{
-  const w = makeWorker();
-  // Scans older than the cooldown window must not count against the user.
-  const frozenNow = new Date('2026-09-28T12:00:00Z').getTime();
-  const old = frozenNow - 20 * 60 * 1000;
-  w.store.local.recentScans = Array.from({ length: 12 }, () => old);
+  // No limit, but many scans already run. The old build refused the 13th
+  // inside the window; the point of this test is that it no longer does,
+  // because X is the only authority on when to stop.
+  w.store.local.recentScans = Array.from({ length: 40 }, () => new Date('2026-09-28T12:00:00Z').getTime());
   w.send({
     type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
   }, profileSender('https://x.com/bob'));
   await new Promise(r => setImmediate(r));
-  eq('stale scans are discarded, so the scan is allowed', w.log.created.length, 1);
-  eq('only the new scan remains', w.store.local.recentScans.length, 1);
+  eq('a busy but unthrottled account is not paused on a scan count', w.log.created.length, 1);
 }
+
+{
+  // The real behaviour: X renders its throttle panel, the content script
+  // reports it, and the worker pauses instead of searching again.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  const scanTabId = w.log.created[0].id;
+  const before = w.log.updated.length;
+
+  const res = await w.send({ type: 'xshuffle:scan-result', token: 'tok-1', post: { rateLimited: true } },
+    scanSender('https://x.com/search?q=x', scanTabId));
+  check('a detected limit is accepted', res?.ok, JSON.stringify(res));
+
+  check('the pause is recorded', w.store.local.cooldownUntil > new Date('2026-09-28T12:00:00Z').getTime(),
+    String(w.store.local.cooldownUntil));
+  eq('the pause is attributed to X, not to a scan count', w.store.local.cooldownReason, 'rate-limited');
+
+  // The regression that matters: the old code read the panel as an empty
+  // window and immediately widened and re-searched, up to 30 times.
+  eq('a throttled scan does not go on to the next date window', w.log.updated.length, before);
+  check('the scan tab is cleaned up', w.log.removed.includes(scanTabId), JSON.stringify(w.log.removed));
+}
+
+{
+  const w = makeWorker();
+  w.store.local.cooldownUntil = new Date('2026-09-28T12:10:00Z').getTime();
+  w.store.local.cooldownReason = 'rate-limited';
+  const res = await w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  eq('a scan during a pause is refused', res?.ok, false);
+  check('the refusal names X as the cause', /rate-limited/i.test(res?.message || ''), res?.message);
+  check('the refusal opens no search tab', w.log.created.length === 0);
+}
+
+{
+  const w = makeWorker();
+  // An expired pause must not linger and block the next scan.
+  w.store.local.cooldownUntil = new Date('2026-09-28T11:00:00Z').getTime();
+  w.store.local.cooldownReason = 'rate-limited';
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  eq('an expired pause does not block a new scan', w.log.created.length, 1);
+  check('the expired pause is cleared', w.store.local.cooldownUntil === undefined,
+    String(w.store.local.cooldownUntil));
+}
+
+{
+  // A scan that never reported is a page that never loaded. Not proof of a
+  // limit, so the pause is the short safety one rather than the long one.
+  const w = makeWorker();
+  w.send({
+    type: 'xshuffle:discover', username: 'bob', joinDate: '2023-01-01', requestId: 1, postCount: 72
+  }, profileSender('https://x.com/bob'));
+  await new Promise(r => setImmediate(r));
+  w.fireAlarm('xshuffle-timeout:tok-1');
+  await new Promise(r => setImmediate(r));
+  eq('a timed-out scan pauses for the short safety interval', w.store.local.cooldownReason, 'scan-failed');
+  const length = w.store.local.cooldownUntil - new Date('2026-09-28T12:00:00Z').getTime();
+  check('the safety pause is materially shorter than a rate-limit pause',
+    length > 0 && length <= 5 * 60 * 1000, String(length));
+}
+
 
 // -------------------------------------------------------- window slider --
 

@@ -156,20 +156,21 @@ windowDaysInput.addEventListener("input", renderWindow);
 windowDaysInput.addEventListener("change", saveOptions);
 renderWindow();
 
-// ---- Rate-limit warning ---------------------------------------------------
+// ---- Rate-limit notice -----------------------------------------------------
+//
+// The worker decides when to pause and stores an expiry, so the popup only
+// renders it. There is no scan budget to count down any more: a pause exists
+// because X rate-limited the account, and the copy says so rather than
+// implying Xshuffle is throttling the user on its own.
 
 const notice = document.getElementById("rate-limit-notice");
-const COOLDOWN_MS = 15 * 60 * 1000;
-const COOLDOWN_SCANS = 12;
 
-chrome.storage.local.get({ recentScans: [] }, ({ recentScans }) => {
-  const now = Date.now();
-  const recent = (recentScans || []).filter(ts => now - ts < COOLDOWN_MS);
-  const remaining = COOLDOWN_SCANS - recent.length;
-  if (remaining <= 3) {
-    notice.hidden = false;
-    notice.textContent = remaining > 0
-      ? `X rate-limits heavy searching, so Xshuffle pauses after ${COOLDOWN_SCANS} scans every ${COOLDOWN_MS / 60000} minutes. ${remaining} scan${remaining === 1 ? "" : "s"} left before the pause.`
-      : "Xshuffle is paused to avoid an X rate limit. Try again shortly.";
-  }
+chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, ({ cooldownUntil, cooldownReason }) => {
+  const remainingMs = (Number(cooldownUntil) || 0) - Date.now();
+  if (remainingMs <= 0) return;
+  const minutes = Math.max(1, Math.ceil(remainingMs / 60000));
+  notice.hidden = false;
+  notice.textContent = cooldownReason === 'rate-limited'
+    ? `X rate-limited this account. Xshuffle is paused for ${minutes} more minute${minutes === 1 ? '' : 's'} rather than searching again and making it worse.`
+    : `A search failed to load, so Xshuffle is paused for ${minutes} more minute${minutes === 1 ? '' : 's'}.`;
 });

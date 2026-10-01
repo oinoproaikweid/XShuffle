@@ -235,6 +235,73 @@ const scanUrl = (extra = '') =>
   check('matches username case-insensitively', r?.post?.id === '1005', JSON.stringify(r));
 }
 
+// ------------------------------------------------------- rate-limit panel
+//
+// When X throttles a search it renders an error panel instead of results.
+// Before this was detected the panel looked exactly like an empty date
+// window, so the worker counted a miss and immediately widened and searched
+// again - hammering an account that had already refused. These fixtures pin
+// the panel apart from a genuine "No results" page, which is the distinction
+// the whole pause depends on.
+
+console.log('\n\x1b[1mRate-limit panel detection\x1b[0m');
+
+/** X's throttle panel: an error heading plus its own Reload control. */
+function rateLimitPage({ heading = 'Something went wrong', button = 'Reload' } = {}) {
+  return `<!doctype html><html><body><div data-testid="primaryColumn">
+    <div><h2>${heading}</h2><span>Try reloading the page.</span></div>
+    <div role="button" tabindex="0">${button}</div>
+  </div></body></html>`;
+}
+
+{
+  const { sent } = await run(rateLimitPage(), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('a throttled page is reported as rate-limited, not as an empty window',
+    r?.post?.rateLimited === true, JSON.stringify(r));
+}
+
+{
+  // The panel must be reported before the "No results" fallback can claim
+  // it, and it must not be dressed up as a post.
+  const { sent } = await run(rateLimitPage({ heading: 'Rate limit exceeded' }), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('an explicit rate-limit heading is detected too', r?.post?.rateLimited === true, JSON.stringify(r));
+  check('a throttled page never yields a post id', !r?.post?.id, JSON.stringify(r));
+}
+
+{
+  // The real regression guard. A genuine empty window carries no error panel,
+  // so it must still be reported as an ordinary miss - otherwise the fix
+  // would pause the user every time a quiet account has a sparse week.
+  const { sent } = await run(searchPage([], { noResults: true }), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('a genuinely empty window is still an ordinary miss',
+    r?.post === null, JSON.stringify(r));
+}
+
+{
+  // The Reload control is what makes this a positive signal. Without it the
+  // page could be anything, so a bare error string must not trip a pause.
+  const html = `<!doctype html><html><body><div data-testid="primaryColumn">
+    <div>Something went wrong</div>
+  </div></body></html>`;
+  const { sent } = await run(html, scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('an error string with no Reload control does not count as throttling',
+    !r?.post?.rateLimited, JSON.stringify(r));
+}
+
+{
+  // Real results must never be mistaken for throttling, even if a post body
+  // happens to contain the words.
+  const posts = [{ user: 'frank', id: '2001', iso: '2023-04-01T10:00:00.000Z' }];
+  const { sent } = await run(searchPage(posts, { inner: '<div>Something went wrong</div><div role="button">Reload</div>' }), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('a page with real posts is not treated as throttled',
+    r?.post?.id === '2001', JSON.stringify(r));
+}
+
 // ------------------------------------------------------------------ summary
 
 console.log(`\n\x1b[1m${pass} passed, ${fail} failed\x1b[0m`);

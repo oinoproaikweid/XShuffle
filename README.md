@@ -46,8 +46,9 @@ you ask for, so a wider window is a genuine trade-off:
 - **Auto** — the default. Xshuffle sizes the window from the account's own age
   and post count.
 
-Heavily used accounts can hit X's search rate limits. Xshuffle pauses itself
-after 12 searches in 15 minutes and tells you when it does.
+Heavily used accounts can hit X's search rate limits. When that happens X
+shows an error page instead of results, and Xshuffle reads it, pauses itself,
+and tells you — rather than searching again and making the limit worse.
 
 ## How it picks a post
 
@@ -69,7 +70,7 @@ own logged-in browser session.
 Stored locally only:
 
 - your show/hide and option preferences
-- a rolling list of recent search timestamps, used for the rate-limit pause
+- a pause expiry and its reason, set only when X rate-limits the account
 
 There is no account, no donation prompt, and no tracking of any kind.
 
@@ -101,7 +102,8 @@ malformed, the build stops rather than shipping unchecked. Copy
 - Accounts with very sparse posting can still come up empty.
 - X may change its profile markup; the selectors are centralized in
   `content.js` when that happens.
-- Shuffle is rate-limited by X, not by Xshuffle. Waiting is the only fix.
+- Shuffle is rate-limited by X, not by Xshuffle. Xshuffle stops as soon as X
+  says so, but it cannot shorten the wait — that one is on X's side.
 
 ## License
 

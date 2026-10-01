@@ -33,11 +33,27 @@
   const PROBE_PAGE_LIMIT = 15;
   const PROBE_TRUST_DAYS = 120;
 
-  // Stop hammering X. Every scan opens real search requests, and X throttles
-  // logged-in accounts that issue them quickly. Once this many scans run
-  // inside the cooldown window, further scans are refused until it expires.
-  const COOLDOWN_SCANS = 12;
-  const COOLDOWN_MS = 15 * 60 * 1000;
+  // Pause when X says so, not on a guessed scan budget.
+  //
+  // The earlier design counted scans and refused the 13th inside a 15 minute
+  // window. That number was never measured against X's real limit, so it was
+  // wrong in both directions: it blocked scans X would have served, and it
+  // still let a single scan fire up to MAX_SCAN_WINDOWS searches in a row
+  // because nothing inside a scan consulted the budget at all.
+  //
+  // X reports throttling directly - the search page renders an error panel
+  // instead of results - and the content script detects that panel. So the
+  // pause is driven by the observed signal, which is both accurate and
+  // self-tuning: accounts with a higher limit are never interrupted, and the
+  // pause can follow how long X actually held it.
+  //
+  // A detected limit still starts a cooldown, because the signal arrives on a
+  // page load that has already cost a request. RATE_LIMIT_COOLDOWN_MS is the
+  // pause after a limit X explicitly showed us; a scan that fails with no
+  // signal gets a shorter SAFETY_COOLDOWN_MS instead, so an ordinary dead
+  // scan does not lock the user out for the full pause.
+  const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
+  const SAFETY_COOLDOWN_MS = 2 * 60 * 1000;
 
   // User-selectable search shaping, mirrored from the popup.
   const DEFAULT_OPTIONS = {
@@ -307,39 +323,45 @@
     chrome.tabs.sendMessage(state.targetTabId, { type: 'xshuffle:progress', requestId: state.requestId, stage, window }, () => void chrome.runtime.lastError);
   }
 
-  // ---- Rate-limit protection -------------------------------------------
+  // ---- Rate-limit handling -------------------------------------------------
   //
-  // X throttles accounts that issue searches quickly, and when it does the
-  // extension stops working for that user for a while with no explanation.
-  // Counting scans in a rolling window and refusing politely is the cheapest
-  // way to stay under the limit without a backend. The count lives in local
-  // storage so it survives a service-worker restart.
+  // Cooldowns are recorded as an expiry timestamp rather than a list of scan
+  // times, because the trigger is an event X reported (or a scan that failed
+  // outright) and not a running tally. Storing the expiry also means the
+  // pause survives a service-worker restart without any bookkeeping, and the
+  // popup can render the same number the worker enforces.
+  //
+  // The expiry is stored in local storage rather than memory so a worker
+  // restart mid-pause does not silently hand the user a fresh budget.
 
-  function recordScanStart() {
-    chrome.storage.local.get({ recentScans: [] }, data => {
-      const now = Date.now();
-      const recent = (data.recentScans || []).filter(ts => now - ts < COOLDOWN_MS);
-      recent.push(now);
-      chrome.storage.local.set({ recentScans: recent });
+  function startCooldown(ms, reason, callback) {
+    const now = Date.now();
+    chrome.storage.local.set({ cooldownUntil: now + ms, cooldownReason: reason }, () => {
+      if (chrome.runtime.lastError) { callback(); return; }
+      callback();
     });
   }
 
   function cooldownStatus(callback) {
-    chrome.storage.local.get({ recentScans: [] }, data => {
+    chrome.storage.local.get({ cooldownUntil: 0, cooldownReason: '' }, data => {
       const now = Date.now();
-      const recent = (data.recentScans || []).filter(ts => now - ts < COOLDOWN_MS);
-      chrome.storage.local.set({ recentScans: recent });
-      if (recent.length >= COOLDOWN_SCANS) {
-        const waitMinutes = Math.max(1, Math.ceil((COOLDOWN_MS - (now - recent[0])) / 60000));
-        callback({
-          blocked: true,
-          count: recent.length,
-          remaining: waitMinutes,
-          message: `X rate-limits heavy search use, so Xshuffle pauses after ${COOLDOWN_SCANS} scans per ${COOLDOWN_MS / 60000} minutes. Try again in about ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'}.`
-        });
-      } else {
-        callback({ blocked: false, count: recent.length, remaining: 0, message: '' });
+      const until = Number(data.cooldownUntil) || 0;
+      if (until <= now) {
+        // Expired: clear it so a stale reason cannot outlive its own pause.
+        if (until) chrome.storage.local.remove(['cooldownUntil', 'cooldownReason']);
+        callback({ blocked: false, remaining: 0, reason: '' });
+        return;
       }
+      const waitMinutes = Math.max(1, Math.ceil((until - now) / 60000));
+      const detected = data.cooldownReason === 'rate-limited';
+      callback({
+        blocked: true,
+        remaining: waitMinutes,
+        reason: data.cooldownReason || '',
+        message: detected
+          ? `X rate-limited this account, so Xshuffle paused for ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'}. Searching again before then would only deepen the limit.`
+          : `Xshuffle paused for ${waitMinutes} minute${waitMinutes === 1 ? '' : 's'} after a search failed to load.`
+      });
     });
   }
 
@@ -439,7 +461,6 @@
       windowDays, options, baseWindowDays: windowDays, emptyWindows: 0
     };
     pending.set(token, state);
-    recordScanStart();
     progress(state, 'picking');
 
     // Open the probe first: one search across the account's whole history,
@@ -501,6 +522,17 @@
         sendResponse({ ok: false, message: 'This scan is no longer active.' });
         return;
       }
+      if (message.post?.rateLimited) {
+        // X rendered its throttle panel. Stop this scan dead rather than
+        // treating the panel as an empty window: every further window is
+        // another search against an account that has already said no.
+        startCooldown(RATE_LIMIT_COOLDOWN_MS, 'rate-limited', () => {
+          finish(message.token, null, 'X rate-limited this account, so Xshuffle paused itself rather than searching again and making it worse. Try again in about 15 minutes.');
+        });
+        sendResponse({ ok: true });
+        return;
+      }
+
       if (!message.post) {
         scanNextWindow(message.token);
         sendResponse({ ok: true });
@@ -599,8 +631,15 @@
     if (!alarm.name.startsWith(prefix)) return;
     const token = alarm.name.slice(prefix.length);
     loadState(token, state => {
-      if (state) finish(token, null, 'X search took too long; try again.');
-      else chrome.alarms.clear(alarm.name);
+      if (!state) { chrome.alarms.clear(alarm.name); return; }
+      // A scan that never reported is a page that never loaded. That is not
+      // proof of a rate limit - the throttle panel is detected explicitly
+      // elsewhere - but it is proof the request went somewhere, so pause
+      // briefly rather than letting the next click fire another identical
+      // search into the same hole. The pause is the short safety one.
+      startCooldown(SAFETY_COOLDOWN_MS, 'scan-failed', () => {
+        finish(token, null, 'X search took too long, so Xshuffle paused briefly rather than retrying into a page that would not load. Try again shortly.');
+      });
     });
   });
 })();
