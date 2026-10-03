@@ -11,3 +11,7 @@ dist/
 .anon-identities
 .anon-identities.local
 .anon-identities.*.local
+
+# Private working notes. Names the real identity behind the public account and
+# exists nowhere on GitHub, so it must never be pushed.
+CODEX_HANDOFF.md

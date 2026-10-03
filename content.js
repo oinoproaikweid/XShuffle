@@ -397,7 +397,7 @@
          existing.querySelector('.xshuffle-button').disabled === !joinDate)) return;
     removeShuffleUI();
     if (!joinDate && warnedFor !== username) {
-      console.warn(`[Xshuffle] Could not find a visible join date for @${username}; Shuffle is disabled.`);
+      console.warn('[Xshuffle] Could not find a visible join date for this profile; Shuffle is disabled.');
       warnedFor = username;
     }
     // A profile visit is the only place these two numbers can be read, so this

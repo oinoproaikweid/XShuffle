@@ -7,6 +7,18 @@
 #   ./scripts/privacy-gate.sh --history <ref>      scan commit metadata
 #   ./scripts/privacy-gate.sh --files A --history HEAD   combine scopes
 #
+# At least one scope is required. Scanning nothing is not a pass.
+#
+# Every path given must exist. A missing --files or --archive path is a hard
+# error, not a skip: these paths are built from a version string, so a
+# mismatch would scan nothing and still report PASSED.
+#
+# Matching is CASE-INSENSITIVE. A name cased one way in a term file and
+# another way in the text - a lowercase handle vs its capitalised form in a
+# commit subject, or in a README credit line - is the same identity, and a
+# case-sensitive gate reports those files clean. Always write terms in
+# whatever case is convenient; it does not matter.
+#
 # Exits non-zero on any hit, so it can gate a release. The identity terms
 # come from the LOCAL, never-committed .anon-identities file. Without that
 # file this refuses to pass: an empty term list would silently allow
@@ -67,7 +79,7 @@ fi
 
 # Validate every pattern compiles. A bad regex here would otherwise make the
 # whole gate silently useless, which is the one outcome that must never happen.
-if ! grep -qEI -f "$PATTERNS" /dev/null 2>/tmp/anon-gate-greperr; then
+if ! grep -qiEI -f "$PATTERNS" /dev/null 2>/tmp/anon-gate-greperr; then
   if [ -s /tmp/anon-gate-greperr ]; then
     echo "BLOCKED: malformed regex in $TERMS_FILE:" >&2
     cat /tmp/anon-gate-greperr >&2
@@ -85,36 +97,81 @@ note_hit() {
   printf '        %s\n' "$2"
 }
 
+# At least one scope is mandatory. Every scan loop below is driven purely by
+# these three variables, so an invocation with none of them set scanned
+# NOTHING and still fell through to the PASSED branch and exit 0 - a green
+# result for zero work. That is the one outcome this gate exists to prevent:
+# a term provably present in a tracked file passed the bare invocation.
+if [ "${#SCAN_FILES[@]}" -eq 0 ] && [ "${#SCAN_ARCHIVES[@]}" -eq 0 ] && [ -z "$SCAN_HISTORY" ]; then
+  cat >&2 <<EOF
+BLOCKED: no scan scope given.
+
+Nothing was selected to scan, so there is nothing this run could have found.
+Pass at least one of:
+
+  --files <path>...     scan file contents
+  --archive <zip>       scan inside an archive
+  --history <ref>       scan commit metadata
+
+Refusing to report PASSED for a run that inspected no files.
+EOF
+  exit 3
+fi
+
 echo "Privacy gate: $(wc -l < "$PATTERNS" | tr -d ' ') identity term(s) loaded from $TERMS_FILE"
 
 # --- 1. Plain files -------------------------------------------------------
 for f in "${SCAN_FILES[@]+"${SCAN_FILES[@]}"}"; do
-  [ -e "$f" ] || { echo "  \033[33mskip\033[0m  $f (does not exist)"; continue; }
+  # A path that does not exist is a hard error, not a skip. These paths are
+  # built from a version string (package.sh derives them from manifest.json),
+  # so a version mismatch produces a path that will never exist - and the run
+  # would scan nothing while still reporting PASSED. That is the same
+  # "green for zero work" failure as passing no scope at all.
+  if [ ! -e "$f" ]; then
+    cat >&2 <<EOF
+BLOCKED: $f does not exist.
+
+Every path given to --files must exist. An unreadable path means the scope
+was wrong - a typo, or a version string that does not match what was built -
+and nothing was scanned. Fix the path or build the artefact first.
+EOF
+    exit 3
+  fi
   echo "Scanning: ${f/#$PWD\//}"
   if [ -d "$f" ]; then
     # -r recurses, -l lists only matching file names
     while IFS= read -r path; do
-      note_hit "identity term in $path" "$(grep -nEI -f "$PATTERNS" "$path" | head -3 | sed 's/^/        /')"
-    done < <(grep -rlEI -f "$PATTERNS" "$f" 2>/dev/null || true)
+      note_hit "identity term in $path" "$(grep -niEI -f "$PATTERNS" "$path" | head -3 | sed 's/^/        /')"
+    done < <(grep -rliEI -f "$PATTERNS" "$f" 2>/dev/null || true)
   else
-    if grep -qEI -f "$PATTERNS" "$f"; then
-      note_hit "identity term in $f" "$(grep -nEI -f "$PATTERNS" "$f" | head -3 | sed 's/^/        /')"
+    if grep -qiEI -f "$PATTERNS" "$f"; then
+      note_hit "identity term in $f" "$(grep -niEI -f "$PATTERNS" "$f" | head -3 | sed 's/^/        /')"
     fi
   fi
 done
 
 # --- 2. Archives ----------------------------------------------------------
 for a in "${SCAN_ARCHIVES[@]+"${SCAN_ARCHIVES[@]}"}"; do
-  [ -f "$a" ] || { echo "  \033[33mskip\033[0m  $a (does not exist)"; continue; }
+  # Same reasoning as --files: a missing archive is a wrong scope, not a skip.
+  if [ ! -f "$a" ]; then
+    cat >&2 <<EOF
+BLOCKED: $a does not exist or is not a regular file.
+
+Every path given to --archive must be an existing archive. Without it the
+release artefact was never scanned, which is the exact thing this gate runs
+to rule out.
+EOF
+    exit 3
+  fi
   echo "Scanning archive: $a"
   tmp="$(mktemp -d)"
   if unzip -qq "$a" -d "$tmp" 2>/dev/null; then
     while IFS= read -r path; do
-      note_hit "identity term inside $a -> ${path#$tmp/}" "$(grep -nEI -f "$PATTERNS" "$path" | head -3 | sed 's/^/        /')"
-    done < <(grep -rlEI -f "$PATTERNS" "$tmp" 2>/dev/null || true)
+      note_hit "identity term inside $a -> ${path#$tmp/}" "$(grep -niEI -f "$PATTERNS" "$path" | head -3 | sed 's/^/        /')"
+    done < <(grep -rliEI -f "$PATTERNS" "$tmp" 2>/dev/null || true)
     # Also check archive member names.
-    if unzip -Z1 "$a" | grep -qEI -f "$PATTERNS"; then
-      note_hit "identity term in archive member name" "$(unzip -Z1 "$a" | grep -EI -f "$PATTERNS" | head -3)"
+    if unzip -Z1 "$a" | grep -qiEI -f "$PATTERNS"; then
+      note_hit "identity term in archive member name" "$(unzip -Z1 "$a" | grep -iEI -f "$PATTERNS" | head -3)"
     fi
   else
     echo "  \033[31mFAIL\033[0m  could not unpack $a"
@@ -127,13 +184,13 @@ done
 if [ -n "$SCAN_HISTORY" ]; then
   echo "Scanning git history metadata: $SCAN_HISTORY"
   LOG="$(git log --all --format='%H%n%an <%ae>%n%cn <%ce>%n%s%n%b' "$SCAN_HISTORY" 2>/dev/null || true)"
-  if printf '%s' "$LOG" | grep -qEI -f "$PATTERNS"; then
-    note_hit "identity term in commit metadata" "$(printf '%s' "$LOG" | grep -nEI -f "$PATTERNS" | head -3)"
+  if printf '%s' "$LOG" | grep -qiEI -f "$PATTERNS"; then
+    note_hit "identity term in commit metadata" "$(printf '%s' "$LOG" | grep -niEI -f "$PATTERNS" | head -3)"
   fi
   # Pushed remotes leak the account name too.
   REMOTES="$(git remote -v 2>/dev/null || true)"
-  if printf '%s' "$REMOTES" | grep -qEI -f "$PATTERNS"; then
-    note_hit "identity term in git remote URL" "$(printf '%s' "$REMOTES" | grep -EI -f "$PATTERNS")"
+  if printf '%s' "$REMOTES" | grep -qiEI -f "$PATTERNS"; then
+    note_hit "identity term in git remote URL" "$(printf '%s' "$REMOTES" | grep -iEI -f "$PATTERNS")"
   fi
 fi
 
