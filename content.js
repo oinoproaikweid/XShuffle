@@ -15,6 +15,8 @@
   ]);
   const MONTHS = 'january february march april may june july august september october november december'.split(' ');
   let enabled = true;
+  let ignoreRateLimitPause = false;
+  let overrideRevision = 0;
   let currentUrl = location.href;
   let pending = false;
   let settingsRevision = 0;
@@ -310,6 +312,7 @@
         console.warn('[Xshuffle] Join date could not be read; shuffle cancelled.');
         return;
       }
+      delete button.dataset.rateLimited;
       button.disabled = true;
       const requestId = crypto.randomUUID();
       button.dataset.requestId = requestId;
@@ -336,14 +339,7 @@
         clearTimeout(recoveryTimer);
         if (chrome.runtime.lastError || !response?.ok) {
           if (response?.rateLimited) {
-            // The gate refused before any search ran. Label it as the limit it
-            // is, and disable, so the button does not read as a retryable miss.
-            const mins = Number(response.remaining) || 0;
-            button.textContent = '⏳ Rate-Limited';
-            button.disabled = true;
-            button.title = mins
-              ? `X rate-limited this account. Xshuffle paused for ${mins} minute${mins === 1 ? '' : 's'}.`
-              : response.message || 'X rate-limited this account.';
+            showRateLimit(button, response);
           } else {
             button.disabled = false;
             button.textContent = '🎲 Try again';
@@ -459,18 +455,9 @@
     article.classList.add('xshuffle-found-post');
   }
 
-  // X signals a throttled search with an error panel rather than an empty
-  // result list: a "Something went wrong" heading beside a Reload button,
-  // with no tweets and no "No results for ..." line. Left undetected that
-  // panel is indistinguishable from a genuinely empty date window, so the
-  // scan treats it as a miss, widens the window and searches again - which
-  // is the exact behaviour that provokes the limit in the first place.
-  //
-  // The Reload button is what makes this a positive signal rather than a
-  // guess: a real empty result set says "No results", so requiring the
-  // error panel's own reload affordance keeps the two cases apart.
-  const RATE_LIMIT_RE = /something went wrong|rate limit exceeded|you're rate limited|too many requests/i;
-  const RATE_LIMIT_RELOAD_RE = /^\s*reload\s*$/i;
+  // Generic reload errors also occur during outages and failed requests.
+  // Only explicit throttling language is evidence of a rate limit.
+  const RATE_LIMIT_RE = /rate limit exceeded|you['’]re rate[ -]limited|too many requests/i;
 
   // How long a search page is given to produce results before the attempt is
   // called a stall. Kept comfortably above a real X search (a couple of
@@ -488,12 +475,9 @@
     // nothing to be throttled about, so posts are checked first and the panel
     // is only believed when the page is actually empty of them.
     if (primary.querySelector('[data-testid="tweet"]')) return false;
-    const scope = primary.innerText || '';
-    if (!RATE_LIMIT_RE.test(scope)) return false;
-    // Require the panel's own Reload control so an unrelated "something went
-    // wrong" string elsewhere on the page cannot trip a pause.
-    const buttons = [...primary.querySelectorAll('button, [role="button"]')];
-    return buttons.some(button => RATE_LIMIT_RELOAD_RE.test((button.innerText || '').trim()));
+    // Read error headings/alerts, not arbitrary page text or search queries.
+    return [...primary.querySelectorAll('h1, h2, h3, [role="heading"], [role="alert"]')]
+      .some(panel => RATE_LIMIT_RE.test(panel.innerText || ''));
   }
 
   // A page that never rendered is not an empty window, and reporting it as one
@@ -624,17 +608,53 @@
     }
   }
 
+  function releaseRateLimit(button) {
+    if (button.dataset.rateLimited !== 'true') return;
+    delete button.dataset.rateLimited;
+    button.disabled = false;
+    button.textContent = '🎲 Try again';
+    button.title = 'Search again';
+  }
+
+  function showRateLimit(button, response) {
+    const mins = Number(response.remaining) || 0;
+    button.dataset.rateLimited = 'true';
+    button.textContent = '⏳ Rate-Limited';
+    button.disabled = true;
+    button.title = response.message || `X rate-limited this account. Try again in ${mins} minutes.`;
+    if (ignoreRateLimitPause) releaseRateLimit(button);
+    // Also recover without a storage event when the pause expires.
+    if (mins > 0) {
+      const requestId = button.dataset.requestId;
+      setTimeout(() => {
+        if (button.dataset.requestId === requestId) releaseRateLimit(button);
+      }, mins * 60000);
+    }
+  }
+
   function loadSettings() {
     const revision = ++settingsRevision;
+    const overrideVersion = overrideRevision;
     removeShuffleUI();
-    chrome.storage.local.get({ showShuffleUI: true }, result => {
+    chrome.storage.local.get({ showShuffleUI: true, ignoreRateLimitPause: false }, result => {
       if (revision !== settingsRevision) return;
       enabled = result.showShuffleUI !== false;
+      if (overrideVersion === overrideRevision) ignoreRateLimitPause = result.ignoreRateLimitPause === true;
       scheduleRefresh();
     });
   }
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local') {
+      if (changes.ignoreRateLimitPause) {
+        overrideRevision += 1;
+        ignoreRateLimitPause = changes.ignoreRateLimitPause.newValue === true;
+      }
+      if (ignoreRateLimitPause || (changes.cooldownUntil &&
+          !(Number(changes.cooldownUntil.newValue) > Date.now()))) {
+        document.querySelectorAll('.xshuffle-button').forEach(releaseRateLimit);
+      }
+    }
     if (area === 'local' && changes.showShuffleUI) {
       settingsRevision += 1;
       enabled = changes.showShuffleUI.newValue !== false;
@@ -651,15 +671,7 @@
         button.textContent = 'Opening post…';
         button.title = 'Opening the selected post';
       } else if (message.response?.rateLimited) {
-        // Say what actually happened. "Try again" on a rate limit invites
-        // the user to click straight back into the limit that X just imposed,
-        // which is the one thing that makes it worse.
-        const mins = Number(message.response.remaining) || 0;
-        button.textContent = '⏳ Rate-Limited';
-        button.disabled = true;
-        button.title = mins
-          ? `X rate-limited this account. Xshuffle paused for ${mins} minute${mins === 1 ? '' : 's'} - searching sooner only deepens the limit.`
-          : message.response.message || 'X rate-limited this account.';
+        showRateLimit(button, message.response);
       } else {
         button.disabled = false;
         button.textContent = '🎲 Try again';

@@ -105,7 +105,7 @@ async function run(html, url, { seedStorage = {} } = {}) {
   dom.window.chrome = {
     runtime: {
       lastError: undefined,
-      onMessage: { addListener() {} },
+      onMessage: { addListener(fn) { dom.window.runtimeMessage = fn; } },
       sendMessage: (msg, cb) => { sent.push(msg); cb && cb({ ok: true }); },
     },
     storage: {
@@ -126,7 +126,7 @@ async function run(html, url, { seedStorage = {} } = {}) {
           for (const k of (Array.isArray(key) ? key : [key])) delete localStore[k];
         }
       },
-      onChanged: { addListener() {} },
+      onChanged: { addListener(fn) { dom.window.storageChanged = fn; } },
     },
   };
   dom.window.eval(SRC);
@@ -297,17 +297,11 @@ const scanUrl = (extra = '') =>
 }
 
 // ------------------------------------------------------- rate-limit panel
-//
-// When X throttles a search it renders an error panel instead of results.
-// Before this was detected the panel looked exactly like an empty date
-// window, so the worker counted a miss and immediately widened and searched
-// again - hammering an account that had already refused. These fixtures pin
-// the panel apart from a genuine "No results" page, which is the distinction
-// the whole pause depends on.
+// Generic reload errors must stay distinct from explicit throttling messages.
 
 console.log('\n\x1b[1mRate-limit panel detection\x1b[0m');
 
-/** X's throttle panel: an error heading plus its own Reload control. */
+/** An X error panel, which may or may not explicitly indicate throttling. */
 function rateLimitPage({ heading = 'Something went wrong', button = 'Reload' } = {}) {
   return `<!doctype html><html><body><div data-testid="primaryColumn">
     <div><h2>${heading}</h2><span>Try reloading the page.</span></div>
@@ -318,8 +312,20 @@ function rateLimitPage({ heading = 'Something went wrong', button = 'Reload' } =
 {
   const { sent } = await run(rateLimitPage(), scanUrl());
   const r = sent.find(m => m.type === 'xshuffle:scan-result');
-  check('a throttled page is reported as rate-limited, not as an empty window',
-    r?.post?.rateLimited === true, JSON.stringify(r));
+  check('a generic reload error is not evidence of throttling',
+    !r?.post?.rateLimited, JSON.stringify(r));
+}
+
+for (const heading of ["You're rate limited", 'Too many requests']) {
+  const { sent } = await run(rateLimitPage({ heading, button: 'Try again' }), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check(`explicit throttling is detected without Reload: ${heading}`, r?.post?.rateLimited === true);
+}
+
+{
+  const { sent } = await run(searchPage([], { noResults: true, inner: '<input value="rate limit exceeded"><div>too many requests</div><button>Reload</button>' }), scanUrl());
+  const r = sent.find(m => m.type === 'xshuffle:scan-result');
+  check('ordinary page text does not falsely flag an empty window', r?.post === null);
 }
 
 {
@@ -342,8 +348,7 @@ function rateLimitPage({ heading = 'Something went wrong', button = 'Reload' } =
 }
 
 {
-  // The Reload control is what makes this a positive signal. Without it the
-  // page could be anything, so a bare error string must not trip a pause.
+  // Generic errors are not evidence of throttling, with or without Reload.
   const html = `<!doctype html><html><body><div data-testid="primaryColumn">
     <div>Something went wrong</div>
   </div></body></html>`;
@@ -477,8 +482,8 @@ console.log('\n\x1b[1mRate-limited button state\x1b[0m');
  * button back. The button is the only place a user learns a search was
  * refused because X throttled them, so its label is the feature.
  */
-async function clickAndReply(response) {
-  await run(profilePage('Joined January 2023'), 'https://x.com/frank');
+async function clickAndReply(response, seedStorage = {}) {
+  await run(profilePage('Joined January 2023'), 'https://x.com/frank', { seedStorage });
   const dom = lastDom;
   // Re-stub sendMessage now that the page exists: the click path reads the
   // response, which run()'s stub always answers {ok:true}.
@@ -503,7 +508,45 @@ async function clickAndReply(response) {
     btn.disabled === true, `disabled=${btn.disabled}`);
   check('the rate-limit title names the cause and the wait',
     /rate-limited/i.test(btn.title) && /15/.test(btn.title), `title="${btn.title}"`);
+  lastDom.window.close();
 }
+{
+  const btn = await clickAndReply({ ok: false, rateLimited: true, remaining: 15 });
+  lastDom.window.storageChanged({ ignoreRateLimitPause: { newValue: true } }, 'local');
+  check('enabling the override immediately unlocks the paused button', !btn.disabled && /try again/i.test(btn.textContent));
+  btn.click();
+  check('the unlocked button sends a new discovery request', currentMessages.filter(m => m.type === 'xshuffle:discover').length === 2);
+  lastDom.window.close();
+}
+{
+  const btn = await clickAndReply({ ok: false, rateLimited: true, remaining: 15 });
+  lastDom.window.storageChanged({ cooldownUntil: { newValue: 0 } }, 'local');
+  check('clearing the pause unlocks the button', !btn.disabled);
+  lastDom.window.close();
+}
+{
+  const btn = await clickAndReply({ ok: false, rateLimited: true, remaining: 15 });
+  lastDom.window.storageChanged({ ignoreRateLimitPause: { newValue: true } }, 'local');
+  btn.click();
+  check('a further rate-limit reply stays retryable with the override on', !btn.disabled);
+  lastDom.window.close();
+}
+
+{
+  const btn = await clickAndReply({ ok: true });
+  lastDom.window.runtimeMessage({ type: 'xshuffle:complete', requestId: btn.dataset.requestId,
+    response: { ok: false, rateLimited: true, remaining: 15 } });
+  check('an asynchronous rate-limit completion pauses the button', btn.disabled);
+  lastDom.window.storageChanged({ ignoreRateLimitPause: { newValue: true } }, 'local');
+  check('the override also unlocks an asynchronous completion', !btn.disabled);
+  lastDom.window.close();
+}
+{
+  const btn = await clickAndReply({ ok: false, rateLimited: true, remaining: 15 }, { ignoreRateLimitPause: true });
+  check('a saved override keeps a rate-limit reply retryable', !btn.disabled);
+  lastDom.window.close();
+}
+
 {
   const btn = await clickAndReply({
     ok: false, message: 'X search found no visible posts for this account.'
@@ -511,6 +554,7 @@ async function clickAndReply(response) {
   check('an ordinary miss still offers Try again',
     /try again/i.test(btn.textContent) && btn.disabled === false,
     `text="${btn.textContent}" disabled=${btn.disabled}`);
+  lastDom.window.close();
 }
 
 // ------------------------------------------- a stall must not be the last word
@@ -564,7 +608,7 @@ const ONE_POST = '<article data-testid="tweet"><a href="/frank/status/123">' +
         },
         set: v => { Object.assign(store, v); }, remove() {},
       },
-      onChanged: { addListener() {} },
+      onChanged: { addListener(fn) { dom.window.storageChanged = fn; } },
     },
   };
   withToolbarGeometry(dom);
@@ -654,7 +698,7 @@ const landingUrl = () =>
         },
         set() {}, remove() {},
       },
-      onChanged: { addListener() {} },
+      onChanged: { addListener(fn) { dom.window.storageChanged = fn; } },
     },
   };
   withToolbarGeometry(dom);
